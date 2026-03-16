@@ -28,6 +28,7 @@ function CursorManager.new(opts)
   self.current_prompt_id = nil
   self._active_request = nil
   self._stdout_buffer = {}
+  self.terminals = {}
 
   return self
 end
@@ -157,7 +158,366 @@ function CursorManager:_handle_message(msg)
     return
   end
 
+  if msg.method == 'fs/read_text_file' then
+    self:_handle_fs_read_text_file(msg.id, msg.params)
+    return
+  end
+
+  if msg.method == 'fs/write_text_file' then
+    self:_handle_fs_write_text_file(msg.id, msg.params)
+    return
+  end
+
+  if msg.method == 'terminal/create' then
+    self:_handle_terminal_create(msg.id, msg.params)
+    return
+  end
+
+  if msg.method == 'terminal/output' then
+    self:_handle_terminal_output(msg.id, msg.params)
+    return
+  end
+
+  if msg.method == 'terminal/wait_for_exit' then
+    self:_handle_terminal_wait_for_exit(msg.id, msg.params)
+    return
+  end
+
+  if msg.method == 'terminal/kill' then
+    self:_handle_terminal_kill(msg.id, msg.params)
+    return
+  end
+
+  if msg.method == 'terminal/release' then
+    self:_handle_terminal_release(msg.id, msg.params)
+    return
+  end
+
   -- Ignore other notifications and Cursor extension methods for now
+end
+
+function CursorManager:_handle_fs_read_text_file(id, params)
+  if not id then
+    return
+  end
+
+  local path = params and params.path or nil
+  local line = params and params.line or nil
+  local limit = params and params.limit or nil
+
+  if not path or path == '' then
+    self:_send_response(id, { content = '' })
+    return
+  end
+
+  local content_lines = nil
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local buf_path = vim.api.nvim_buf_get_name(bufnr)
+      if buf_path == path then
+        content_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        break
+      end
+    end
+  end
+
+  if not content_lines then
+    if vim.fn.filereadable(path) ~= 1 then
+      self:_send_response(id, { content = '' })
+      return
+    end
+    local ok, lines = pcall(vim.fn.readfile, path)
+    if not ok or not lines then
+      self:_send_response(id, { content = '' })
+      return
+    end
+    content_lines = lines
+  end
+
+  local start_idx = 1
+  if type(line) == 'number' and line > 0 then
+    start_idx = line
+  end
+
+  local end_idx = #content_lines
+  if type(limit) == 'number' and limit > 0 then
+    end_idx = math.min(end_idx, start_idx + limit - 1)
+  end
+
+  local slice = {}
+  for i = start_idx, end_idx do
+    if content_lines[i] == nil then
+      break
+    end
+    table.insert(slice, content_lines[i])
+  end
+
+  local content = table.concat(slice, '\n')
+  if content ~= '' then
+    content = content .. '\n'
+  end
+
+  self:_send_response(id, { content = content })
+end
+
+function CursorManager:_handle_fs_write_text_file(id, params)
+  if not id then
+    return
+  end
+
+  local path = params and params.path or nil
+  local content = params and params.content or ''
+
+  if not path or path == '' then
+    self:_send_response(id, vim.NIL)
+    return
+  end
+
+  local lines = {}
+  for line in tostring(content):gmatch('[^\r\n]+') do
+    table.insert(lines, line)
+  end
+  if #lines == 0 then
+    lines = { '' }
+  end
+
+  pcall(function()
+    vim.fn.writefile(lines, path)
+  end)
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local buf_path = vim.api.nvim_buf_get_name(bufnr)
+      if buf_path == path then
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+        break
+      end
+    end
+  end
+
+  self:_send_response(id, vim.NIL)
+end
+
+function CursorManager:_handle_terminal_create(id, params)
+  if not id then
+    return
+  end
+
+  local command = params and params.command or nil
+  local args = params and params.args or {}
+  local cwd = params and params.cwd or nil
+  local env_param = params and params.env or {}
+  local output_byte_limit = params and params.outputByteLimit or 1048576
+
+  if not command or command == '' then
+    self:_send_response(id, { terminalId = nil })
+    return
+  end
+
+  local cmd = { command }
+  if type(args) == 'table' then
+    for _, a in ipairs(args) do
+      table.insert(cmd, a)
+    end
+  end
+
+  local env = nil
+  if type(env_param) == 'table' then
+    env = {}
+    for _, pair in ipairs(env_param) do
+      if pair.name and pair.value then
+        env[pair.name] = pair.value
+      end
+    end
+  end
+
+  local term_id = 'term_' .. tostring(self.next_id)
+  self.next_id = self.next_id + 1
+
+  local state = {
+    id = term_id,
+    output = '',
+    truncated = false,
+    exit_status = { exitCode = nil, signal = nil },
+    byte_limit = output_byte_limit,
+    waiters = {},
+  }
+
+  local function append_output(chunk)
+    if not chunk or chunk == '' then
+      return
+    end
+    local new_output = state.output .. chunk
+    if #new_output > state.byte_limit then
+      local excess = #new_output - state.byte_limit
+      new_output = new_output:sub(excess + 1)
+      state.truncated = true
+    end
+    state.output = new_output
+  end
+
+  local job_opts = {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data, _)
+      if not data then
+        return
+      end
+      for _, line in ipairs(data) do
+        if line and line ~= '' then
+          append_output(line .. '\n')
+        end
+      end
+    end,
+    on_stderr = function(_, data, _)
+      if not data then
+        return
+      end
+      for _, line in ipairs(data) do
+        if line and line ~= '' then
+          append_output(line .. '\n')
+        end
+      end
+    end,
+    on_exit = function(_, exit_code, _)
+      state.exit_status.exitCode = exit_code
+      state.exit_status.signal = nil
+      if state.waiters then
+        for _, waiter_id in ipairs(state.waiters) do
+          self:_send_response(waiter_id, {
+            exitCode = state.exit_status.exitCode,
+            signal = state.exit_status.signal,
+          })
+        end
+        state.waiters = {}
+      end
+    end,
+  }
+
+  if cwd and cwd ~= '' then
+    job_opts.cwd = cwd
+  end
+  if env then
+    job_opts.env = env
+  end
+
+  local job_id = vim.fn.jobstart(cmd, job_opts)
+  if job_id <= 0 then
+    self:_send_response(id, { terminalId = nil })
+    return
+  end
+
+  state.job_id = job_id
+  self.terminals[term_id] = state
+
+  self:_send_response(id, { terminalId = term_id })
+end
+
+function CursorManager:_handle_terminal_output(id, params)
+  if not id then
+    return
+  end
+
+  local terminal_id = params and params.terminalId or nil
+  if not terminal_id then
+    self:_send_response(id, {
+      output = '',
+      truncated = false,
+      exitStatus = nil,
+    })
+    return
+  end
+
+  local state = self.terminals[terminal_id]
+  if not state then
+    self:_send_response(id, {
+      output = '',
+      truncated = false,
+      exitStatus = nil,
+    })
+    return
+  end
+
+  self:_send_response(id, {
+    output = state.output or '',
+    truncated = state.truncated or false,
+    exitStatus = state.exit_status,
+  })
+end
+
+function CursorManager:_handle_terminal_wait_for_exit(id, params)
+  if not id then
+    return
+  end
+
+  local terminal_id = params and params.terminalId or nil
+  if not terminal_id then
+    self:_send_response(id, {
+      exitCode = nil,
+      signal = nil,
+    })
+    return
+  end
+
+  local state = self.terminals[terminal_id]
+  if not state then
+    self:_send_response(id, {
+      exitCode = nil,
+      signal = nil,
+    })
+    return
+  end
+
+  if state.exit_status and state.exit_status.exitCode ~= nil then
+    self:_send_response(id, {
+      exitCode = state.exit_status.exitCode,
+      signal = state.exit_status.signal,
+    })
+    return
+  end
+
+  state.waiters = state.waiters or {}
+  table.insert(state.waiters, id)
+end
+
+function CursorManager:_handle_terminal_kill(id, params)
+  if not id then
+    return
+  end
+
+  local terminal_id = params and params.terminalId or nil
+  if not terminal_id then
+    self:_send_response(id, vim.NIL)
+    return
+  end
+
+  local state = self.terminals[terminal_id]
+  if state and state.job_id and state.job_id > 0 then
+    vim.fn.jobstop(state.job_id)
+  end
+
+  self:_send_response(id, vim.NIL)
+end
+
+function CursorManager:_handle_terminal_release(id, params)
+  if not id then
+    return
+  end
+
+  local terminal_id = params and params.terminalId or nil
+  if not terminal_id then
+    self:_send_response(id, vim.NIL)
+    return
+  end
+
+  local state = self.terminals[terminal_id]
+  if state and state.job_id and state.job_id > 0 then
+    vim.fn.jobstop(state.job_id)
+  end
+
+  self.terminals[terminal_id] = nil
+  self:_send_response(id, vim.NIL)
 end
 
 function CursorManager:_handle_session_update(update)
@@ -205,13 +565,71 @@ function CursorManager:_handle_request_permission(id, params)
     return
   end
 
-  local _request = params or {}
-  self:_send_response(id, {
-    outcome = {
-      outcome = 'selected',
-      optionId = 'allow-once',
-    },
-  })
+  local request = params or {}
+  local options = request.options or {}
+
+  -- If no UI is available or no options provided, fall back to allow-once
+  if not vim.ui or not vim.ui.select or type(options) ~= 'table' or #options == 0 then
+    self:_send_response(id, {
+      outcome = {
+        outcome = 'selected',
+        optionId = 'allow-once',
+      },
+    })
+    return
+  end
+
+  local items = {}
+  for _, opt in ipairs(options) do
+    local label = opt.label or opt.id or opt.optionId or ''
+    local id_or_option = opt.id or opt.optionId or ''
+    if id_or_option ~= '' then
+      table.insert(items, label .. ' [' .. id_or_option .. ']')
+    else
+      table.insert(items, label)
+    end
+  end
+
+  local function choose_default_option()
+    local reject_idx = nil
+    local allow_once_idx = nil
+
+    for idx, opt in ipairs(options) do
+      local oid = opt.id or opt.optionId or ''
+      if oid == 'reject-once' and not reject_idx then
+        reject_idx = idx
+      elseif oid == 'allow-once' and not allow_once_idx then
+        allow_once_idx = idx
+      end
+    end
+
+    if reject_idx then
+      return options[reject_idx]
+    end
+    if allow_once_idx then
+      return options[allow_once_idx]
+    end
+    return options[1]
+  end
+
+  vim.schedule(function()
+    vim.ui.select(items, {
+      prompt = request.title or 'Cursor agent requests permission',
+    }, function(_choice, idx)
+      local selected = options[idx]
+      if not selected then
+        selected = choose_default_option()
+      end
+
+      local option_id = selected.id or selected.optionId or 'allow-once'
+      self:_send_response(id, {
+        outcome = {
+          outcome = 'selected',
+          optionId = option_id,
+        },
+      })
+    end)
+  end)
 end
 
 function CursorManager:_ensure_session(current_file, cb)
@@ -229,8 +647,8 @@ function CursorManager:_ensure_session(current_file, cb)
     self:_send_request('initialize', {
       protocolVersion = 1,
       clientCapabilities = {
-        fs = { readTextFile = false, writeTextFile = false },
-        terminal = false,
+        fs = { readTextFile = true, writeTextFile = true },
+        terminal = true,
       },
       clientInfo = {
         name = 'cursor-nvim',
