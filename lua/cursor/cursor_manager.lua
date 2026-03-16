@@ -3,57 +3,51 @@ CursorManager.__index = CursorManager
 
 function CursorManager.new(opts)
   local self = setmetatable({}, CursorManager)
-  
+
   opts = opts or {}
-  self.model = opts.model or 'auto'
-  self.current_job_id = nil
-  
-  if not self:_check_cursor_cli() then
-    vim.notify('cursor-agent CLI not found. Install it with: curl https://cursor.com/install -fsS | bash', vim.log.levels.WARN)
+
+  -- ACP configuration (defaults to Cursor CLI `agent acp`)
+  self.acp = opts.acp or {}
+  if self.acp.enabled == nil then
+    self.acp.enabled = true
   end
-  
+  self.acp.command = self.acp.command or 'agent'
+  self.acp.args = self.acp.args or { 'acp' }
+  self.acp.auth_method = self.acp.auth_method or 'cursor_login'
+
+  -- Legacy model option is kept for compatibility but unused in ACP mode
+  self.model = opts.model or 'auto'
+
+  -- JSON-RPC / ACP state
+  self.proc_job_id = nil
+  self.next_id = 1
+  self.pending = {}
+  self.session_id = nil
+  self.initialized = false
+  self.authenticated = false
+  self.current_prompt_id = nil
+  self._active_request = nil
+  self._stdout_buffer = {}
+
   return self
 end
 
-function CursorManager:send_chat_message(message, callback)
-  local current_file = vim.api.nvim_buf_get_name(0)
-  local project_context = self:get_project_context(current_file)
-  
-  local full_prompt = project_context
-  if full_prompt ~= '' then
-    full_prompt = full_prompt .. '\n\nUser request: ' .. message
-  else
-    full_prompt = message
+function CursorManager:_ensure_acp_process()
+  if self.proc_job_id and self.proc_job_id > 0 then
+    return true
   end
-  
-  local args = {'--print', '--output-format', 'stream-json', '--stream-partial-output'}
-  
-  if self.model then
-    table.insert(args, '--model')
-    table.insert(args, self.model)
+
+  if not self:_check_cursor_cli() then
+    vim.notify('Cursor ACP CLI (`agent`) not found. Install Cursor and ensure `agent` is in PATH.', vim.log.levels.ERROR)
+    return false
   end
-  
-  self._was_stopped = false
-  
-  local accumulated_content = ''
-  local accumulated_changes = {}
-  local current_file_for_changes = current_file
-  local partial_json = ''
-  local has_received_text_delta = false
-  local has_thinking_section = false
-  local was_stopped = false
-  
-  local last_update_content = ''
-  local function schedule_update()
-    if callback and accumulated_content ~= last_update_content then
-      last_update_content = accumulated_content
-      vim.schedule(function()
-        callback(accumulated_content, accumulated_changes, true)
-      end)
-    end
+
+  local cmd = { self.acp.command }
+  for _, arg in ipairs(self.acp.args or {}) do
+    table.insert(cmd, arg)
   end
-  
-  self.current_job_id = vim.fn.jobstart({'cursor-agent', unpack(args)}, {
+
+  self.proc_job_id = vim.fn.jobstart(cmd, {
     stdout_buffered = false,
     stderr_buffered = false,
     stdin = 'pipe',
@@ -61,253 +55,329 @@ function CursorManager:send_chat_message(message, callback)
       if not data or #data == 0 then
         return
       end
-      
-      for _, chunk in ipairs(data) do
-        if chunk and chunk ~= '' then
-          partial_json = partial_json .. chunk
-          
-          while true do
-            local start_pos = partial_json:find('{')
-            if not start_pos then
-              break
-            end
-            
-            local depth = 0
-            local end_pos = nil
-            for i = start_pos, #partial_json do
-              local char = partial_json:sub(i, i)
-              if char == '{' then
-                depth = depth + 1
-              elseif char == '}' then
-                depth = depth - 1
-                if depth == 0 then
-                  end_pos = i
-                  break
-                end
-              end
-            end
-            
-            if end_pos then
-              local json_str = partial_json:sub(start_pos, end_pos)
-              local ok, json_data = pcall(vim.json.decode, json_str)
-              if ok and json_data then
-                if json_data.type == 'text_delta' and json_data.text then
-                  has_received_text_delta = true
-                  if has_thinking_section and not accumulated_content:match('\n\n---\n\n') then
-                    accumulated_content = accumulated_content .. '\n\n---\n\n'
-                  end
-                  accumulated_content = accumulated_content .. json_data.text
-                  schedule_update()
-                elseif json_data.type == 'thinking' and json_data.subtype == 'delta' then
-                  if json_data.text and json_data.text ~= '' then
-                    if not has_thinking_section then
-                      accumulated_content = '**Thinking:**\n\n' .. accumulated_content
-                      has_thinking_section = true
-                    end
-                    accumulated_content = accumulated_content .. json_data.text
-                    schedule_update()
-                  end
-                elseif json_data.type == 'assistant' then
-                  has_received_text_delta = true
-                  local new_content = ''
-                  if json_data.content then
-                    if type(json_data.content) == 'string' then
-                      new_content = json_data.content
-                    elseif type(json_data.content) == 'table' then
-                      for _, item in ipairs(json_data.content) do
-                        if item.type == 'text' and item.text then
-                          new_content = new_content .. item.text
-                        end
-                      end
-                    end
-                  elseif json_data.message and json_data.message.content then
-                    if type(json_data.message.content) == 'string' then
-                      new_content = json_data.message.content
-                    elseif type(json_data.message.content) == 'table' then
-                      for _, item in ipairs(json_data.message.content) do
-                        if item.type == 'text' and item.text then
-                          new_content = new_content .. item.text
-                        end
-                      end
-                    end
-                  elseif json_data.text then
-                    new_content = json_data.text
-                  end
-                  
-                  if new_content ~= '' and #new_content > #accumulated_content then
-                    accumulated_content = new_content
-                    schedule_update()
-                  end
-                elseif json_data.type == 'result' then
-                elseif json_data.type == 'thinking' then
-                  if json_data.text and json_data.text ~= '' then
-                    if not has_thinking_section then
-                      accumulated_content = '**Thinking:**\n\n' .. accumulated_content
-                      has_thinking_section = true
-                    end
-                    accumulated_content = accumulated_content .. json_data.text
-                    schedule_update()
-                  end
-                elseif json_data.type == 'system' or json_data.type == 'init' or json_data.type == 'user' then
-                elseif json_data.type == 'message' and json_data.content then
-                  if not has_received_text_delta then
-                    if type(json_data.content) == 'string' then
-                      accumulated_content = accumulated_content .. json_data.content
-                      schedule_update()
-                    elseif type(json_data.content) == 'table' then
-                      for _, item in ipairs(json_data.content) do
-                        if item.type == 'text' and item.text then
-                          accumulated_content = accumulated_content .. item.text
-                          schedule_update()
-                        end
-                      end
-                    end
-                  end
-                end
-              end
-              partial_json = partial_json:sub(end_pos + 1)
-            else
-              break
-            end
+
+      for _, line in ipairs(data) do
+        if line and line ~= '' then
+          local ok, msg = pcall(vim.json.decode, line)
+          if ok and msg then
+            self:_handle_message(msg)
           end
         end
       end
     end,
     on_stderr = function(_, data, _)
       if data and #data > 0 then
-        local error_msg = table.concat(data, '\n')
-        if error_msg and error_msg ~= '' then
-          accumulated_content = accumulated_content .. '\n[Error: ' .. error_msg .. ']'
-          schedule_update()
+        local msg = table.concat(data, '\n')
+        if msg and msg ~= '' then
+          vim.notify('Cursor ACP stderr: ' .. msg, vim.log.levels.WARN)
         end
       end
     end,
-    on_exit = function(_, exit_code, _)
-      self.current_job_id = nil
-      
-      if self._was_stopped then
-        if callback then
-          vim.schedule(function()
-            callback(accumulated_content, accumulated_changes, false)
-          end)
-        end
-        return
-      end
-      if exit_code ~= 0 then
-        vim.notify('cursor-agent exited with code ' .. exit_code, vim.log.levels.ERROR)
-      end
-      
-      if partial_json ~= '' then
-        local trimmed = partial_json:gsub('^%s+', ''):gsub('%s+$', '')
-        if trimmed ~= '' then
-          local remaining = trimmed
-          while true do
-            local start_pos = remaining:find('{')
-            if not start_pos then
-              break
-            end
-            
-            local depth = 0
-            local end_pos = nil
-            for i = start_pos, #remaining do
-              local char = remaining:sub(i, i)
-              if char == '{' then
-                depth = depth + 1
-              elseif char == '}' then
-                depth = depth - 1
-                if depth == 0 then
-                  end_pos = i
-                  break
-                end
-              end
-            end
-            
-            if end_pos then
-              local json_str = remaining:sub(start_pos, end_pos)
-              local ok, json_data = pcall(vim.json.decode, json_str)
-              if ok and json_data then
-                if json_data.type == 'text_delta' and json_data.text then
-                  has_received_text_delta = true
-                  accumulated_content = accumulated_content .. json_data.text
-                elseif json_data.type == 'thinking' and json_data.subtype == 'delta' and json_data.text then
-                  if not has_thinking_section then
-                    accumulated_content = '**Thinking:**\n\n' .. accumulated_content
-                    has_thinking_section = true
-                  end
-                  accumulated_content = accumulated_content .. json_data.text
-                  has_received_text_delta = true
-                elseif json_data.type == 'assistant' or json_data.type == 'result' then
-                elseif json_data.type == 'message' and json_data.content then
-                  if not has_received_text_delta then
-                    if type(json_data.content) == 'string' then
-                      accumulated_content = accumulated_content .. json_data.content
-                    elseif type(json_data.content) == 'table' then
-                      for _, item in ipairs(json_data.content) do
-                        if item.type == 'text' and item.text then
-                          accumulated_content = accumulated_content .. item.text
-                        end
-                      end
-                    end
-                  end
-                end
-              end
-              remaining = remaining:sub(end_pos + 1)
-            else
-              break
-            end
-          end
-        end
-      end
-      
-      if accumulated_content == '' or accumulated_content:match('^%s*$') then
-        if partial_json ~= '' then
-          local trimmed = partial_json:gsub('^%s+', ''):gsub('%s+$', '')
-          if trimmed ~= '' then
-            local ok, json_data = pcall(vim.json.decode, trimmed)
-            if ok and json_data then
-              if json_data.type == 'text_delta' and json_data.text then
-                accumulated_content = accumulated_content .. json_data.text
-              elseif json_data.text then
-                accumulated_content = accumulated_content .. json_data.text
-              elseif json_data.content and type(json_data.content) == 'string' then
-                accumulated_content = accumulated_content .. json_data.content
-              end
-          end
-        end
-      end
-      
-      if (accumulated_content == '' or accumulated_content:match('^%s*$')) and not self._was_stopped then
-          accumulated_content = 'No response received from cursor-agent. Please check your CURSOR_API_KEY and try again.'
-        end
-      end
-      
-      if accumulated_content:match('^```') or accumulated_content:match('```') then
-        local code_blocks = {}
-        for block in accumulated_content:gmatch('```[^`]*```') do
-          table.insert(code_blocks, block)
-        end
-        if #code_blocks > 0 then
-          accumulated_changes = self:_parse_code_changes(code_blocks, current_file_for_changes)
-        end
-      end
-      
-      if callback then
-        vim.schedule(function()
-          callback(accumulated_content, accumulated_changes, false)
-        end)
-      end
+    on_exit = function(_, _exit_code, _)
+      self.proc_job_id = nil
+      self.initialized = false
+      self.authenticated = false
+      self.session_id = nil
+      self.current_prompt_id = nil
+      self.pending = {}
+      self._active_request = nil
     end,
   })
-  
-  if self.current_job_id <= 0 then
-    vim.notify('Failed to start cursor-agent job. Make sure Cursor CLI is installed: curl https://cursor.com/install -fsS | bash', vim.log.levels.ERROR)
-    self.current_job_id = nil
-    callback('', {}, false)
+
+  if self.proc_job_id <= 0 then
+    vim.notify('Failed to start Cursor ACP CLI. Make sure `agent` is installed and in PATH.', vim.log.levels.ERROR)
+    self.proc_job_id = nil
+    return false
+  end
+
+  return true
+end
+
+function CursorManager:_send_json(obj)
+  if not (self.proc_job_id and self.proc_job_id > 0) then
     return
   end
-  
-  vim.fn.chansend(self.current_job_id, full_prompt .. '\n')
-  vim.fn.chanclose(self.current_job_id, 'stdin')
+  local ok, encoded = pcall(vim.json.encode, obj)
+  if not ok or not encoded then
+    return
+  end
+  vim.fn.chansend(self.proc_job_id, encoded .. '\n')
+end
+
+function CursorManager:_send_request(method, params, on_result)
+  if not self:_ensure_acp_process() then
+    return nil
+  end
+
+  local id = self.next_id
+  self.next_id = self.next_id + 1
+
+  if on_result then
+    self.pending[id] = on_result
+  end
+
+  self:_send_json({
+    jsonrpc = '2.0',
+    id = id,
+    method = method,
+    params = params or {},
+  })
+
+  return id
+end
+
+function CursorManager:_send_response(id, result)
+  if not id then
+    return
+  end
+  self:_send_json({
+    jsonrpc = '2.0',
+    id = id,
+    result = result,
+  })
+end
+
+function CursorManager:_handle_message(msg)
+  if msg.id and (msg.result or msg.error) then
+    local cb = self.pending[msg.id]
+    self.pending[msg.id] = nil
+    if cb then
+      cb(msg.result, msg.error)
+    end
+    return
+  end
+
+  if msg.method == 'session/update' and msg.params and msg.params.update then
+    self:_handle_session_update(msg.params.update)
+    return
+  end
+
+  if msg.method == 'session/request_permission' then
+    self:_handle_request_permission(msg.id, msg.params)
+    return
+  end
+
+  -- Ignore other notifications and Cursor extension methods for now
+end
+
+function CursorManager:_handle_session_update(update)
+  if not self._active_request or not update then
+    return
+  end
+
+  local update_type = update.sessionUpdate or update.type
+  if update_type ~= 'agent_message_chunk' then
+    return
+  end
+
+  local content = update.content or {}
+  local text = ''
+  if type(content) == 'table' then
+    if content.text and type(content.text) == 'string' then
+      text = content.text
+    elseif content.type == 'text' and content.value then
+      text = content.value
+    end
+  elseif type(content) == 'string' then
+    text = content
+  end
+
+  if text == '' then
+    return
+  end
+
+  local current = self._active_request.content or ''
+  current = current .. text
+  self._active_request.content = current
+
+  local cb = self._active_request.callback
+  if cb and current ~= self._active_request.last_stream_content then
+    self._active_request.last_stream_content = current
+    local changes = self._active_request.changes or {}
+    vim.schedule(function()
+      cb(current, changes, true)
+    end)
+  end
+end
+
+function CursorManager:_handle_request_permission(id, params)
+  if not id then
+    return
+  end
+
+  local _request = params or {}
+  self:_send_response(id, {
+    outcome = {
+      outcome = 'selected',
+      optionId = 'allow-once',
+    },
+  })
+end
+
+function CursorManager:_ensure_session(current_file, cb)
+  if not self:_ensure_acp_process() then
+    cb(false)
+    return
+  end
+
+  local function ensure_initialized(done)
+    if self.initialized then
+      done(true)
+      return
+    end
+
+    self:_send_request('initialize', {
+      protocolVersion = 1,
+      clientCapabilities = {
+        fs = { readTextFile = false, writeTextFile = false },
+        terminal = false,
+      },
+      clientInfo = {
+        name = 'cursor-nvim',
+        version = '0.1.0',
+      },
+    }, function(result, _err)
+      if result then
+        self.initialized = true
+        done(true)
+      else
+        done(false)
+      end
+    end)
+  end
+
+  local function ensure_authenticated(done)
+    if self.authenticated then
+      done(true)
+      return
+    end
+
+    self:_send_request('authenticate', {
+      methodId = self.acp.auth_method or 'cursor_login',
+    }, function(result, _err)
+      if result then
+        self.authenticated = true
+        done(true)
+      else
+        done(false)
+      end
+    end)
+  end
+
+  local function ensure_session_id(done)
+    if self.session_id then
+      done(true)
+      return
+    end
+
+    local cwd = self:get_project_root(current_file)
+    self:_send_request('session/new', {
+      cwd = cwd,
+      mcpServers = {},
+    }, function(result, _err)
+      if result and result.sessionId then
+        self.session_id = result.sessionId
+        done(true)
+      else
+        done(false)
+      end
+    end)
+  end
+
+  ensure_initialized(function(ok)
+    if not ok then
+      cb(false)
+      return
+    end
+    ensure_authenticated(function(ok2)
+      if not ok2 then
+        cb(false)
+        return
+      end
+      ensure_session_id(function(ok3)
+        cb(ok3)
+      end)
+    end)
+  end)
+end
+
+function CursorManager:send_chat_message(message, callback)
+  if not self.acp.enabled then
+    vim.notify('ACP is disabled in CursorManager options.', vim.log.levels.ERROR)
+    if callback then
+      callback('', {}, false)
+    end
+    return
+  end
+
+  local current_file = vim.api.nvim_buf_get_name(0)
+  local project_context = self:get_project_context(current_file)
+
+  local full_prompt = project_context
+  if full_prompt ~= '' then
+    full_prompt = full_prompt .. '\n\nUser request: ' .. message
+  else
+    full_prompt = message
+  end
+
+  local function finalize_request()
+    if not self._active_request then
+      return
+    end
+
+    local accumulated_content = self._active_request.content or ''
+    local accumulated_changes = self._active_request.changes or {}
+
+    if accumulated_content ~= '' and accumulated_content:match('```') then
+      local code_blocks = {}
+      for block in accumulated_content:gmatch('```[^`]*```') do
+        table.insert(code_blocks, block)
+      end
+      if #code_blocks > 0 then
+        accumulated_changes = self:_parse_code_changes(code_blocks, current_file)
+      end
+    end
+
+    local cb = self._active_request.callback
+    self._active_request = nil
+    if cb then
+      vim.schedule(function()
+        cb(accumulated_content, accumulated_changes, false)
+      end)
+    end
+  end
+
+  local function start_prompt()
+    self._active_request = {
+      callback = callback,
+      content = '',
+      changes = {},
+      last_stream_content = '',
+    }
+
+    local prompt_items = {
+      { type = 'text', text = full_prompt },
+    }
+
+    local params = {
+      sessionId = self.session_id,
+      prompt = prompt_items,
+    }
+
+    self.current_prompt_id = self:_send_request('session/prompt', params, function(_result)
+      finalize_request()
+    end)
+  end
+
+  self:_ensure_session(current_file, function(ok)
+    if not ok then
+      if callback then
+        callback('Failed to initialize ACP session. Make sure `agent` CLI is installed and authenticated (run `agent login`).', {}, false)
+      end
+      return
+    end
+    start_prompt()
+  end)
 end
 
 function CursorManager:_parse_code_changes(code_blocks, current_file)
@@ -343,7 +413,7 @@ function CursorManager:_parse_code_changes(code_blocks, current_file)
 end
 
 function CursorManager:_check_cursor_cli()
-  local handle = io.popen('which cursor-agent 2>/dev/null')
+  local handle = io.popen('which ' .. (self.acp.command or 'agent') .. ' 2>/dev/null')
   if handle then
     local result = handle:read('*a')
     handle:close()
@@ -352,7 +422,7 @@ function CursorManager:_check_cursor_cli()
     end
   end
   
-  local handle2 = io.popen('cursor-agent --version 2>/dev/null')
+  local handle2 = io.popen((self.acp.command or 'agent') .. ' --version 2>/dev/null')
   if handle2 then
     local result = handle2:read('*a')
     handle2:close()
@@ -533,13 +603,28 @@ function CursorManager:get_project_context(current_file)
 end
 
 function CursorManager:stop()
-  if self.current_job_id and self.current_job_id > 0 then
-    self._was_stopped = true
-    vim.fn.jobstop(self.current_job_id)
-    self.current_job_id = nil
-    return true
+  local stopped = false
+
+  if self.session_id and self.proc_job_id then
+    local ok = pcall(function()
+      self:_send_request('session/cancel', { sessionId = self.session_id }, function() end)
+    end)
+    if ok then
+      stopped = true
+    end
   end
-  return false
+
+  if self.proc_job_id and self.proc_job_id > 0 then
+    vim.fn.jobstop(self.proc_job_id)
+    self.proc_job_id = nil
+    stopped = true
+  end
+
+  if self._active_request then
+    self._active_request = nil
+  end
+
+  return stopped
 end
 
 return CursorManager
