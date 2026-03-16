@@ -158,12 +158,12 @@ function CursorManager:_handle_message(msg)
     return
   end
 
-  if msg.method == 'fs/read_text_file' then
+  if msg.method == 'fs/read_text_file' or msg.method == 'fs/readTextFile' then
     self:_handle_fs_read_text_file(msg.id, msg.params)
     return
   end
 
-  if msg.method == 'fs/write_text_file' then
+  if msg.method == 'fs/write_text_file' or msg.method == 'fs/writeTextFile' then
     self:_handle_fs_write_text_file(msg.id, msg.params)
     return
   end
@@ -729,9 +729,7 @@ function CursorManager:send_chat_message(message, callback)
   end
 
   local current_file = vim.api.nvim_buf_get_name(0)
-  local project_context = self:get_project_context(current_file)
-
-  local full_prompt = project_context
+  local full_prompt = self:get_session_context(current_file)
   if full_prompt ~= '' then
     full_prompt = full_prompt .. '\n\nUser request: ' .. message
   else
@@ -744,7 +742,13 @@ function CursorManager:send_chat_message(message, callback)
     end
 
     local accumulated_content = self._active_request.content or ''
-    local accumulated_changes = self._active_request.changes or {}
+    local accumulated_changes = {}
+
+    if self._active_request.changes and #self._active_request.changes > 0 then
+      for _, ch in ipairs(self._active_request.changes) do
+        table.insert(accumulated_changes, ch)
+      end
+    end
 
     if accumulated_content ~= '' and accumulated_content:match('```') then
       local code_blocks = {}
@@ -752,7 +756,10 @@ function CursorManager:send_chat_message(message, callback)
         table.insert(code_blocks, block)
       end
       if #code_blocks > 0 then
-        accumulated_changes = self:_parse_code_changes(code_blocks, current_file)
+        local parsed = self:_parse_code_changes(code_blocks, current_file)
+        for _, ch in ipairs(parsed) do
+          table.insert(accumulated_changes, ch)
+        end
       end
     end
 
@@ -986,13 +993,9 @@ function CursorManager:get_open_buffers_context()
     if vim.api.nvim_buf_is_loaded(bufnr) then
       local filepath = vim.api.nvim_buf_get_name(bufnr)
       if filepath and filepath ~= '' and vim.fn.filereadable(filepath) == 1 then
-        local content = self:get_file_context(filepath)
-        if content then
-          table.insert(buffers, {
-            path = filepath,
-            content = content
-          })
-        end
+        table.insert(buffers, {
+          path = filepath,
+        })
       end
     end
   end
@@ -1018,6 +1021,43 @@ function CursorManager:get_project_context(current_file)
   end
   
   return table.concat(context_parts, '\n')
+end
+
+function CursorManager:get_session_context(current_file)
+  local parts = {}
+
+  local project_root = self:get_project_root(current_file)
+  local project_structure = self:get_project_structure(project_root, 1, 30)
+  local open_buffers = self:get_open_buffers_context()
+
+  table.insert(parts, '## Neovim Session Context')
+  table.insert(parts, '')
+
+  if project_root then
+    table.insert(parts, 'Project root: ' .. project_root)
+  end
+
+  if current_file and current_file ~= '' then
+    table.insert(parts, 'Current file: ' .. current_file)
+  end
+
+  if #open_buffers > 0 then
+    table.insert(parts, '')
+    table.insert(parts, 'Open buffers:')
+    for _, buf in ipairs(open_buffers) do
+      table.insert(parts, '- ' .. buf.path)
+    end
+  end
+
+  if project_structure and #project_structure > 0 then
+    table.insert(parts, '')
+    table.insert(parts, 'Project structure (shallow):')
+    for _, entry in ipairs(project_structure) do
+      table.insert(parts, '- ' .. entry)
+    end
+  end
+
+  return table.concat(parts, '\n')
 end
 
 function CursorManager:stop()

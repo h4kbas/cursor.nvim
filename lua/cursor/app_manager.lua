@@ -153,21 +153,21 @@ function AppManager:send_message(message)
       self.chat_manager:set_streaming_response(response)
       self.window_manager:update_chat_display_streaming(self.chat_manager, response)
     else
-      if response and response ~= '' and not response:match('^%s*$') then
+      local has_response = response and response ~= '' and not response:match('^%s*$')
+      if has_response then
         self.chat_manager:add_message('assistant', response)
-        self.chat_manager:clear_streaming_response()
-        self.chat_manager:set_status('idle')
-        if changes and #changes > 0 then
-          self.chat_manager:set_last_changes(changes)
-        end
-        self.window_manager:update_chat_display(self.chat_manager)
-        self.window_manager:focus_input()
-      else
-        self.chat_manager:clear_streaming_response()
-        self.chat_manager:set_status('idle')
-        self.window_manager:update_chat_display(self.chat_manager)
-        self.window_manager:focus_input()
       end
+
+      self.chat_manager:clear_streaming_response()
+      self.chat_manager:set_status('idle')
+
+      if changes and #changes > 0 then
+        self.chat_manager:set_last_changes(changes)
+        self:show_last_changes()
+      end
+
+      self.window_manager:update_chat_display(self.chat_manager)
+      self.window_manager:focus_input()
     end
   end)
 end
@@ -249,6 +249,43 @@ function AppManager:revert_changes()
   end
   
   self.chat_manager:clear_last_changes()
+end
+
+function AppManager:show_last_changes()
+  local last_changes = self.chat_manager:get_last_changes()
+  if not last_changes or #last_changes == 0 then
+    return
+  end
+
+  local qf_items = {}
+  for _, change in ipairs(last_changes) do
+    if change.type == 'edit' and change.file then
+      local bufnr = vim.fn.bufnr(change.file, false)
+      table.insert(qf_items, {
+        bufnr = bufnr ~= -1 and bufnr or nil,
+        filename = change.file,
+        lnum = change.start_line or 1,
+        col = 1,
+        text = 'Cursor change: ' .. change.file,
+      })
+    end
+  end
+  
+  if #qf_items == 0 then
+    return
+  end
+  
+  vim.fn.setqflist(qf_items, 'r', { title = 'Cursor Changes' })
+  vim.cmd('botright copen')
+  
+  local info = vim.fn.getqflist({ winid = 1 })
+  local winid = info.winid
+  if winid ~= nil and winid ~= 0 and vim.api.nvim_win_is_valid(winid) then
+    local bufnr = vim.api.nvim_win_get_buf(winid)
+    if self.binding_manager then
+      self.binding_manager:register_diff_bindings_for_buffer(bufnr)
+    end
+  end
 end
 
 return AppManager
