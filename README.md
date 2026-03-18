@@ -41,4 +41,4 @@ require('cursor').setup({
 
 **Prerequisites**: 
 - Neovim 0.7+
-- Cursor CLI installed (`cursor-agent` command). The plugin uses Cursor's official CLI (`cursor-agent`) which automatically uses your Cursor subscription - no additional costs!
+- Cursor Agent CLI installed (https://cursor.com/blog/cli). The plugin uses Cursor's official CLI which automatically uses your Cursor subscription - no additional costs!
