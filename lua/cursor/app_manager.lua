@@ -40,6 +40,11 @@ function AppManager:open_chat()
   if not self.cursor_manager then
     self.cursor_manager = CursorManager.new(self.opts)
   end
+
+  self.cursor_manager:set_permission_request_handler(function(content)
+    self.chat_manager:add_message('assistant', content)
+    self.window_manager:update_chat_display(self.chat_manager)
+  end)
   
   self.window_manager.opts = self.opts
   

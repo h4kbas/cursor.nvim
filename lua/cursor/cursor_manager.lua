@@ -29,6 +29,7 @@ function CursorManager.new(opts)
   self._active_request = nil
   self._stdout_buffer = {}
   self.terminals = {}
+  self.on_permission_request = opts.on_permission_request
 
   return self
 end
@@ -566,7 +567,71 @@ function CursorManager:_handle_request_permission(id, params)
   end
 
   local request = params or {}
-  local options = request.options or {}
+  local raw_options = request.options or {}
+  local options = {}
+  self:_notify_permission_request(request)
+
+  local function normalize_option(opt, fallback_id)
+    if type(opt) == 'string' then
+      return {
+        id = opt,
+        label = opt,
+      }
+    end
+
+    if type(opt) ~= 'table' then
+      return nil
+    end
+
+    local option_id = opt.id or opt.optionId or fallback_id
+    local label = opt.label or option_id or ''
+    return {
+      id = option_id,
+      optionId = opt.optionId,
+      label = label,
+    }
+  end
+
+  if type(raw_options) == 'table' then
+    local has_array_items = false
+    for i, value in ipairs(raw_options) do
+      has_array_items = true
+      local normalized = normalize_option(value)
+      if normalized then
+        table.insert(options, normalized)
+      end
+    end
+
+    if not has_array_items then
+      for key, value in pairs(raw_options) do
+        local fallback_id = type(key) == 'string' and key or nil
+        local normalized = normalize_option(value, fallback_id)
+        if normalized then
+          table.insert(options, normalized)
+        end
+      end
+    end
+  end
+
+  if #options > 1 then
+    local preferred_order = {
+      ['allow-once'] = 1,
+      ['allow-always'] = 2,
+      ['reject-once'] = 3,
+    }
+    table.sort(options, function(a, b)
+      local a_id = a.id or a.optionId or ''
+      local b_id = b.id or b.optionId or ''
+      local a_rank = preferred_order[a_id] or 100
+      local b_rank = preferred_order[b_id] or 100
+      if a_rank == b_rank then
+        local a_label = a.label or a_id
+        local b_label = b.label or b_id
+        return a_label < b_label
+      end
+      return a_rank < b_rank
+    end)
+  end
 
   -- If no UI is available or no options provided, fall back to allow-once
   if not vim.ui or not vim.ui.select or type(options) ~= 'table' or #options == 0 then
@@ -612,9 +677,19 @@ function CursorManager:_handle_request_permission(id, params)
     return options[1]
   end
 
+  local command_text, _, _ = self:_format_permission_command(request)
+  local prompt_text = request.title or 'Cursor agent requests permission'
+  if command_text and command_text ~= '' then
+    local preview = command_text:gsub('%s+', ' ')
+    if #preview > 120 then
+      preview = preview:sub(1, 117) .. '...'
+    end
+    prompt_text = prompt_text .. ' | ' .. preview
+  end
+
   vim.schedule(function()
     vim.ui.select(items, {
-      prompt = request.title or 'Cursor agent requests permission',
+      prompt = prompt_text,
     }, function(_choice, idx)
       local selected = options[idx]
       if not selected then
@@ -630,6 +705,204 @@ function CursorManager:_handle_request_permission(id, params)
       })
     end)
   end)
+end
+
+function CursorManager:_format_permission_command(request)
+  local command = nil
+  local args = nil
+  local cwd = nil
+  local detail = nil
+
+  local function extract_args(value)
+    if type(value) == 'table' then
+      return value
+    end
+    return nil
+  end
+
+  local function set_command_from_table(tbl)
+    if type(tbl) ~= 'table' then
+      return false
+    end
+
+    if type(tbl.title) == 'string' and tbl.title ~= '' then
+      command = tbl.title
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.command) == 'string' and tbl.command ~= '' then
+      command = tbl.command
+      args = extract_args(tbl.args) or extract_args(tbl.argv) or extract_args(tbl.arguments)
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.commandLine) == 'string' and tbl.commandLine ~= '' then
+      command = tbl.commandLine
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.cmd) == 'string' and tbl.cmd ~= '' then
+      command = tbl.cmd
+      args = extract_args(tbl.args) or extract_args(tbl.argv)
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.executable) == 'string' and tbl.executable ~= '' then
+      command = tbl.executable
+      args = extract_args(tbl.argv) or extract_args(tbl.args)
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.toolName) == 'string' and tbl.toolName ~= '' then
+      local server = ''
+      if type(tbl.server) == 'string' and tbl.server ~= '' then
+        server = tbl.server
+      elseif type(tbl.mcpServer) == 'string' and tbl.mcpServer ~= '' then
+        server = tbl.mcpServer
+      end
+      if server ~= '' then
+        command = 'MCP ' .. server .. '/' .. tbl.toolName
+      else
+        command = 'MCP ' .. tbl.toolName
+      end
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.tool) == 'string' and tbl.tool ~= '' then
+      command = 'Tool ' .. tbl.tool
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.method) == 'string' and tbl.method ~= '' then
+      command = 'Method ' .. tbl.method
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.action) == 'string' and tbl.action ~= '' then
+      command = 'Action ' .. tbl.action
+      if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+        cwd = tbl.cwd
+      end
+      return true
+    end
+
+    if type(tbl.description) == 'string' and tbl.description ~= '' then
+      detail = tbl.description
+    elseif type(tbl.reason) == 'string' and tbl.reason ~= '' then
+      detail = tbl.reason
+    elseif type(tbl.text) == 'string' and tbl.text ~= '' and not detail then
+      detail = tbl.text
+    end
+
+    return false
+  end
+
+  local function pick_from_table(tbl)
+    if type(tbl) ~= 'table' then
+      return false
+    end
+
+    if set_command_from_table(tbl) then
+      return true
+    end
+
+    for _, value in pairs(tbl) do
+      if type(value) == 'table' then
+        if pick_from_table(value) then
+          return true
+        end
+      end
+    end
+
+    return false
+  end
+
+  pick_from_table(request)
+
+  if not command then
+    local ok, encoded = pcall(vim.json.encode, request)
+    if ok and encoded and encoded ~= '{}' then
+      return nil, cwd, encoded
+    end
+    return nil, cwd, detail
+  end
+
+  local parts = { command }
+  if type(args) == 'table' then
+    for _, arg in ipairs(args) do
+      if arg ~= nil then
+        table.insert(parts, tostring(arg))
+      end
+    end
+  end
+
+  return table.concat(parts, ' '), cwd, detail
+end
+
+function CursorManager:_notify_permission_request(request)
+  local cb = self.on_permission_request
+  if type(cb) ~= 'function' then
+    return
+  end
+
+  local lines = { '## Permission request', '' }
+  local title = request and request.title or 'Cursor agent requests permission'
+  table.insert(lines, title)
+
+  local command_text, cwd, detail_text = self:_format_permission_command(request or {})
+  if command_text and command_text ~= '' then
+    table.insert(lines, '')
+    table.insert(lines, 'Command')
+    table.insert(lines, '`' .. command_text .. '`')
+  end
+
+  if detail_text and detail_text ~= '' then
+    table.insert(lines, '')
+    table.insert(lines, 'Details')
+    table.insert(lines, detail_text)
+  end
+
+  if cwd and cwd ~= '' then
+    table.insert(lines, '')
+    table.insert(lines, 'Working directory: `' .. cwd .. '`')
+  end
+
+  local content = table.concat(lines, '\n')
+  vim.schedule(function()
+    cb(content, request)
+  end)
+end
+
+function CursorManager:set_permission_request_handler(handler)
+  if type(handler) == 'function' then
+    self.on_permission_request = handler
+  else
+    self.on_permission_request = nil
+  end
 end
 
 function CursorManager:_ensure_session(current_file, cb)
