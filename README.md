@@ -2,6 +2,9 @@
 
 A Neovim plugin that connects Neovim to Cursor's agent via **ACP (Agent Client Protocol)**, providing a Cursor‑like chat and code‑editing experience inside Neovim.
 
+<img width="1470" height="879" alt="Screenshot 2026-03-18 at 07 15 28" src="https://github.com/user-attachments/assets/b6a9ffbf-62d2-48dd-a785-6b618531af22" />
+
+
 **Note**: This project is still ongoing and under active development!
 
 ## Features
@@ -38,4 +41,4 @@ require('cursor').setup({
 
 **Prerequisites**: 
 - Neovim 0.7+
-- Cursor CLI installed (`cursor-agent` command). The plugin uses Cursor's official CLI (`cursor-agent`) which automatically uses your Cursor subscription - no additional costs!
+- Cursor Agent CLI installed (https://cursor.com/blog/cli). The plugin uses Cursor's official CLI which automatically uses your Cursor subscription - no additional costs!
