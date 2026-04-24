@@ -20,6 +20,8 @@ function ChatManager:initialize()
   self.last_changes = {}
   self.input_buffer = {}
   self.status = 'idle'
+  self.streaming_response = ''
+  self.last_sent_message = ''
   self.affected_files = {}
 end
 
@@ -27,6 +29,9 @@ function ChatManager:cleanup()
   self.messages = {}
   self.last_changes = {}
   self.input_buffer = {}
+  self.streaming_response = ''
+  self.last_sent_message = ''
+  self.status = 'idle'
   self.affected_files = {}
 end
 
@@ -146,6 +151,31 @@ end
 
 function ChatManager:get_affected_files()
   return self.affected_files
+end
+
+function ChatManager:get_state()
+  return {
+    messages = vim.deepcopy(self.messages),
+    last_sent_message = self.last_sent_message,
+    affected_files = vim.deepcopy(self.affected_files),
+  }
+end
+
+function ChatManager:load_state(state)
+  self:initialize()
+  if type(state) ~= 'table' then
+    return
+  end
+
+  if type(state.messages) == 'table' then
+    self.messages = vim.deepcopy(state.messages)
+  end
+  if type(state.last_sent_message) == 'string' then
+    self.last_sent_message = state.last_sent_message
+  end
+  if type(state.affected_files) == 'table' then
+    self.affected_files = vim.deepcopy(state.affected_files)
+  end
 end
 
 function ChatManager:format_messages_for_display()

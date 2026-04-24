@@ -18,6 +18,9 @@ function AppManager.new()
   self.commands = nil
   
   self.is_open = false
+  self.session_store = nil
+  self.session_store_path = nil
+  self.current_session_id = nil
   
   return self
 end
@@ -32,6 +35,253 @@ function AppManager:setup_commands()
   self.commands:register()
 end
 
+function AppManager:_get_project_root()
+  if self.cursor_manager then
+    return self.cursor_manager:get_project_root(vim.fn.getcwd())
+  end
+  return vim.fn.getcwd()
+end
+
+function AppManager:_get_session_store_path()
+  if self.session_store_path then
+    return self.session_store_path
+  end
+
+  local root = self:_get_project_root() or vim.fn.getcwd()
+  local project_key = vim.fn.fnamemodify(root, ':p')
+  project_key = project_key:gsub('[^%w%._%-]', '_')
+  local base_dir = vim.fn.stdpath('data') .. '/cursor.nvim/sessions'
+  vim.fn.mkdir(base_dir, 'p')
+  self.session_store_path = base_dir .. '/' .. project_key .. '.json'
+  return self.session_store_path
+end
+
+function AppManager:_default_session_data()
+  return {
+    current_session_id = nil,
+    sessions = {},
+  }
+end
+
+function AppManager:_create_session(name)
+  local now = os.time()
+  local id = tostring(now) .. '_' .. tostring(math.random(1000, 9999))
+  return {
+    id = id,
+    name = name or ('Session ' .. os.date('%Y-%m-%d %H:%M')),
+    updated_at = now,
+    state = {
+      messages = {},
+      last_sent_message = '',
+      affected_files = {},
+    },
+  }
+end
+
+function AppManager:_ensure_session_store()
+  if self.session_store then
+    return
+  end
+
+  local path = self:_get_session_store_path()
+  local store = self:_default_session_data()
+
+  if vim.fn.filereadable(path) == 1 then
+    local ok_read, lines = pcall(vim.fn.readfile, path)
+    if ok_read and type(lines) == 'table' then
+      local raw = table.concat(lines, '\n')
+      if raw ~= '' then
+        local ok_decode, decoded = pcall(vim.json.decode, raw)
+        if ok_decode and type(decoded) == 'table' then
+          if type(decoded.sessions) == 'table' then
+            store.sessions = decoded.sessions
+          end
+          if type(decoded.current_session_id) == 'string' then
+            store.current_session_id = decoded.current_session_id
+          end
+        end
+      end
+    end
+  end
+
+  if #store.sessions == 0 then
+    local initial = self:_create_session('Session 1')
+    table.insert(store.sessions, initial)
+    store.current_session_id = initial.id
+  end
+
+  if not store.current_session_id or store.current_session_id == '' then
+    store.current_session_id = store.sessions[1].id
+  end
+
+  self.session_store = store
+  self.current_session_id = store.current_session_id
+end
+
+function AppManager:_save_session_store()
+  if not self.session_store then
+    return
+  end
+
+  self.session_store.current_session_id = self.current_session_id
+  local path = self:_get_session_store_path()
+  local encoded = vim.json.encode(self.session_store)
+  vim.fn.writefile({ encoded }, path)
+end
+
+function AppManager:_get_current_session()
+  self:_ensure_session_store()
+  for _, session in ipairs(self.session_store.sessions) do
+    if session.id == self.current_session_id then
+      return session
+    end
+  end
+  return nil
+end
+
+function AppManager:_persist_current_session()
+  local session = self:_get_current_session()
+  if not session then
+    return
+  end
+  session.state = self.chat_manager:get_state()
+  session.updated_at = os.time()
+  self:_save_session_store()
+end
+
+function AppManager:_load_current_session_into_chat()
+  local session = self:_get_current_session()
+  if not session then
+    self.chat_manager:initialize()
+    return
+  end
+  self.chat_manager:load_state(session.state or {})
+end
+
+function AppManager:new_session(name)
+  self:_ensure_session_store()
+  self:_persist_current_session()
+
+  local created = self:_create_session(name)
+  table.insert(self.session_store.sessions, 1, created)
+  self.current_session_id = created.id
+  self:_load_current_session_into_chat()
+  self:_save_session_store()
+
+  if self.is_open then
+    self.window_manager:update_chat_display(self.chat_manager)
+    self.window_manager:focus_input()
+  end
+end
+
+function AppManager:switch_session(session_id)
+  if type(session_id) ~= 'string' or session_id == '' then
+    return
+  end
+
+  self:_ensure_session_store()
+  self:_persist_current_session()
+
+  local found = false
+  for _, session in ipairs(self.session_store.sessions) do
+    if session.id == session_id then
+      found = true
+      break
+    end
+  end
+  if not found then
+    return
+  end
+
+  self.current_session_id = session_id
+  self:_load_current_session_into_chat()
+  self:_save_session_store()
+
+  if self.is_open then
+    self.window_manager:update_chat_display(self.chat_manager)
+    self.window_manager:focus_input()
+  end
+end
+
+function AppManager:delete_session(session_id)
+  if type(session_id) ~= 'string' or session_id == '' then
+    return
+  end
+
+  self:_ensure_session_store()
+  local kept = {}
+  for _, session in ipairs(self.session_store.sessions) do
+    if session.id ~= session_id then
+      table.insert(kept, session)
+    end
+  end
+  self.session_store.sessions = kept
+
+  if #self.session_store.sessions == 0 then
+    local created = self:_create_session('Session 1')
+    table.insert(self.session_store.sessions, created)
+    self.current_session_id = created.id
+  elseif self.current_session_id == session_id then
+    self.current_session_id = self.session_store.sessions[1].id
+  end
+
+  self:_load_current_session_into_chat()
+  self:_save_session_store()
+
+  if self.is_open then
+    self.window_manager:update_chat_display(self.chat_manager)
+    self.window_manager:focus_input()
+  end
+end
+
+function AppManager:list_sessions()
+  self:_ensure_session_store()
+  return self.session_store.sessions, self.current_session_id
+end
+
+function AppManager:manage_sessions()
+  self:_ensure_session_store()
+  self:_persist_current_session()
+
+  local sessions, current_id = self:list_sessions()
+  local entries = {}
+  local map = {}
+
+  table.insert(entries, '+ New session')
+  map['+ New session'] = { action = 'new' }
+
+  for _, session in ipairs(sessions) do
+    local prefix = session.id == current_id and '* ' or '  '
+    local label = prefix .. (session.name or session.id) .. ' [' .. session.id .. ']'
+    table.insert(entries, label)
+    map[label] = { action = 'switch', id = session.id }
+  end
+
+  vim.ui.select(entries, {
+    prompt = 'Cursor sessions',
+  }, function(choice)
+    local selected = map[choice or '']
+    if not selected then
+      return
+    end
+
+    if selected.action == 'new' then
+      vim.ui.input({ prompt = 'Session name: ' }, function(input)
+        if input and input ~= '' then
+          self:new_session(input)
+        else
+          self:new_session(nil)
+        end
+      end)
+      return
+    end
+
+    if selected.action == 'switch' and selected.id then
+      self:switch_session(selected.id)
+    end
+  end)
+end
+
 function AppManager:open_chat()
   if self.is_open then
     return
@@ -43,18 +293,21 @@ function AppManager:open_chat()
 
   self.cursor_manager:set_permission_request_handler(function(content)
     self.chat_manager:add_message('assistant', content)
+    self:_persist_current_session()
     self.window_manager:update_chat_display(self.chat_manager)
   end)
   self.cursor_manager:set_activity_update_handler(function(content, _, affected_files)
     self.chat_manager:add_affected_files(affected_files)
     self.chat_manager:upsert_activity_message(content)
+    self:_persist_current_session()
     self.window_manager:update_chat_display(self.chat_manager)
   end)
   
   self.window_manager.opts = self.opts
   
   self.window_manager:create_chat_window()
-  self.chat_manager:initialize()
+  self:_ensure_session_store()
+  self:_load_current_session_into_chat()
   self.is_open = true
   
   if self.binding_manager then
@@ -77,6 +330,7 @@ function AppManager:handle_send_message(message_text)
   self.chat_manager:set_last_sent_message(message)
   self.chat_manager:clear_affected_files()
   self.chat_manager:add_message('user', message)
+  self:_persist_current_session()
   self.window_manager:clear_input()
   self.window_manager:update_chat_display(self.chat_manager)
   vim.schedule(function()
@@ -143,6 +397,7 @@ function AppManager:close()
   vim.api.nvim_set_current_buf(chat_bufnr)
   
   self.window_manager:close_chat_window()
+  self:_persist_current_session()
   self.chat_manager:cleanup()
   self.is_open = false
 end
@@ -222,6 +477,7 @@ function AppManager:send_message(message)
         self:show_last_changes()
       end
 
+      self:_persist_current_session()
       self.window_manager:update_chat_display(self.chat_manager)
       self.window_manager:focus_input()
     end
