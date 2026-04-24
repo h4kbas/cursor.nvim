@@ -369,6 +369,17 @@ function WindowManager:focus_input()
   end
 end
 
+function WindowManager:focus_chat()
+  if self.chat_winid and vim.api.nvim_win_is_valid(self.chat_winid) then
+    vim.api.nvim_set_current_win(self.chat_winid)
+    local line_count = vim.api.nvim_buf_line_count(self.chat_bufnr)
+    if line_count > 0 then
+      vim.api.nvim_win_set_cursor(self.chat_winid, {line_count, 0})
+    end
+    vim.cmd('stopinsert')
+  end
+end
+
 function WindowManager:clear_input()
   if self.input_bufnr and vim.api.nvim_buf_is_valid(self.input_bufnr) then
     vim.api.nvim_buf_set_lines(self.input_bufnr, 0, -1, false, {''})

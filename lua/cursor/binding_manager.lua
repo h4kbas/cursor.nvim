@@ -10,6 +10,7 @@ function BindingManager.new(app_manager)
       send_message_insert = "<C-CR>",
       close = "q",
       stop = "<C-c>",
+      focus_toggle = "<C-]>",
     },
     diff = {
       apply = "a",
@@ -64,6 +65,17 @@ function BindingManager:register_chat_bindings(window_manager)
     })
   end
 
+  if self.bindings.chat.focus_toggle then
+    vim.keymap.set('n', self.bindings.chat.focus_toggle, function()
+      window_manager:focus_input()
+    end, {
+      buffer = chat_bufnr,
+      desc = "cursor chat: focus input",
+      silent = true,
+      noremap = true,
+    })
+  end
+
   local function open_affected_file()
     app_mgr:open_affected_file_under_cursor()
   end
@@ -105,6 +117,29 @@ function BindingManager:register_chat_bindings(window_manager)
     vim.keymap.set('n', self.bindings.chat.close, close_chat, {
       buffer = input_bufnr,
       desc = "cursor chat: close",
+      silent = true,
+      noremap = true,
+    })
+  end
+
+  if self.bindings.chat.focus_toggle then
+    vim.keymap.set('n', self.bindings.chat.focus_toggle, function()
+      window_manager:focus_chat()
+    end, {
+      buffer = input_bufnr,
+      desc = "cursor chat: focus history",
+      silent = true,
+      noremap = true,
+    })
+
+    vim.keymap.set('i', self.bindings.chat.focus_toggle, function()
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'n', false)
+      vim.schedule(function()
+        window_manager:focus_chat()
+      end)
+    end, {
+      buffer = input_bufnr,
+      desc = "cursor chat: focus history",
       silent = true,
       noremap = true,
     })
