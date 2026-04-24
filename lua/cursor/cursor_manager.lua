@@ -1161,6 +1161,159 @@ function CursorManager:set_activity_update_handler(handler)
   end
 end
 
+function CursorManager:_is_image_path(path)
+  if type(path) ~= 'string' or path == '' then
+    return false
+  end
+  local lower = path:lower()
+  return lower:match('%.png$') ~= nil
+    or lower:match('%.jpe?g$') ~= nil
+    or lower:match('%.webp$') ~= nil
+    or lower:match('%.gif$') ~= nil
+    or lower:match('%.bmp$') ~= nil
+end
+
+function CursorManager:_mime_type_for_path(path)
+  local lower = (path or ''):lower()
+  if lower:match('%.png$') then
+    return 'image/png'
+  elseif lower:match('%.jpe?g$') then
+    return 'image/jpeg'
+  elseif lower:match('%.webp$') then
+    return 'image/webp'
+  elseif lower:match('%.gif$') then
+    return 'image/gif'
+  elseif lower:match('%.bmp$') then
+    return 'image/bmp'
+  end
+  return 'application/octet-stream'
+end
+
+function CursorManager:_extract_image_paths_from_message(message)
+  local text = message or ''
+  local paths = {}
+  local seen = {}
+  local spans = {}
+
+  local function add_path(path, raw_match)
+    if type(path) ~= 'string' or path == '' then
+      return
+    end
+    path = path:gsub('^file://', '')
+    path = path:gsub('^%s+', ''):gsub('%s+$', '')
+    if path:sub(1, 1) == '"' and path:sub(-1) == '"' then
+      path = path:sub(2, -2)
+    end
+    if not self:_is_image_path(path) then
+      return
+    end
+    if vim.fn.filereadable(path) ~= 1 then
+      return
+    end
+    if seen[path] then
+      return
+    end
+    seen[path] = true
+    table.insert(paths, path)
+    if type(raw_match) == 'string' and raw_match ~= '' then
+      table.insert(spans, raw_match)
+    end
+  end
+
+  for raw, path in text:gmatch('(!%b[]%(([^)]+)%))') do
+    add_path(path, raw)
+  end
+  for raw in text:gmatch('(file://[%w%._%-%/%s]+)') do
+    add_path(raw, raw)
+  end
+  for raw in text:gmatch('(/[%w%._%-%/%s]+%.%w+)') do
+    add_path(raw, raw)
+  end
+
+  return paths, spans
+end
+
+function CursorManager:_base64_encode_bytes(bytes)
+  if not bytes or bytes == '' then
+    return nil
+  end
+  if vim.base64 and vim.base64.encode then
+    local ok, encoded = pcall(vim.base64.encode, bytes)
+    if ok and encoded and encoded ~= '' then
+      return encoded
+    end
+  end
+
+  local tmp_path = vim.fn.tempname()
+  local f = io.open(tmp_path, 'wb')
+  if not f then
+    return nil
+  end
+  f:write(bytes)
+  f:close()
+  local escaped = vim.fn.shellescape(tmp_path)
+  local out = vim.fn.system('base64 ' .. escaped)
+  pcall(vim.fn.delete, tmp_path)
+  if type(out) == 'string' and out ~= '' then
+    out = out:gsub('%s+', '')
+    if out ~= '' then
+      return out
+    end
+  end
+  return nil
+end
+
+function CursorManager:_build_image_prompt_items(message_text)
+  local image_paths, raw_spans = self:_extract_image_paths_from_message(message_text)
+  local cleaned_text = message_text or ''
+  for _, raw in ipairs(raw_spans or {}) do
+    cleaned_text = cleaned_text:gsub(vim.pesc(raw), ' ')
+  end
+  cleaned_text = cleaned_text:gsub('%s+\n', '\n')
+  cleaned_text = cleaned_text:gsub('\n%s+', '\n')
+  cleaned_text = cleaned_text:gsub('[ \t]+', ' ')
+  cleaned_text = cleaned_text:gsub('\n\n\n+', '\n\n')
+  cleaned_text = cleaned_text:gsub('^%s+', ''):gsub('%s+$', '')
+
+  if #image_paths == 0 then
+    return {}, message_text or ''
+  end
+
+  local items = {}
+  for _, path in ipairs(image_paths) do
+    local f = io.open(path, 'rb')
+    if f then
+      local bytes = f:read('*a')
+      f:close()
+      local data = self:_base64_encode_bytes(bytes)
+      if data and data ~= '' then
+        table.insert(items, {
+          type = 'image',
+          source = {
+            type = 'base64',
+            mediaType = self:_mime_type_for_path(path),
+            data = data,
+          },
+        })
+      end
+    end
+  end
+
+  return items, cleaned_text
+end
+
+function CursorManager:set_active_session_id(session_id)
+  if type(session_id) == 'string' and session_id ~= '' then
+    self.session_id = session_id
+  else
+    self.session_id = nil
+  end
+end
+
+function CursorManager:get_active_session_id()
+  return self.session_id
+end
+
 function CursorManager:_ensure_session(current_file, cb)
   if not self:_ensure_acp_process() then
     cb(false)
@@ -1258,11 +1411,17 @@ function CursorManager:send_chat_message(message, callback)
   end
 
   local current_file = vim.api.nvim_buf_get_name(0)
+  local image_prompt_items, cleaned_message = self:_build_image_prompt_items(message)
+  local user_request = cleaned_message
+  if not user_request or user_request == '' then
+    user_request = 'Please analyze the attached image(s).'
+  end
+
   local full_prompt = self:get_session_context(current_file)
   if full_prompt ~= '' then
-    full_prompt = full_prompt .. '\n\nUser request: ' .. message
+    full_prompt = full_prompt .. '\n\nUser request: ' .. user_request
   else
-    full_prompt = message
+    full_prompt = user_request
   end
 
   local function finalize_request()
@@ -1301,6 +1460,8 @@ function CursorManager:send_chat_message(message, callback)
     end
   end
 
+  local prompt_retried = false
+
   local function start_prompt()
     self._active_request = {
       callback = callback,
@@ -1312,15 +1473,44 @@ function CursorManager:send_chat_message(message, callback)
     local prompt_items = {
       { type = 'text', text = full_prompt },
     }
+    for _, item in ipairs(image_prompt_items) do
+      table.insert(prompt_items, item)
+    end
 
-    local params = {
-      sessionId = self.session_id,
-      prompt = prompt_items,
-    }
+    local function issue_prompt()
+      local params = {
+        sessionId = self.session_id,
+        prompt = prompt_items,
+      }
 
-    self.current_prompt_id = self:_send_request('session/prompt', params, function(_result)
-      finalize_request()
-    end)
+      self.current_prompt_id = self:_send_request('session/prompt', params, function(_result, err)
+        if err and not prompt_retried then
+          prompt_retried = true
+
+          local tried_image_items = #image_prompt_items > 0
+          if tried_image_items then
+            prompt_items = {
+              { type = 'text', text = full_prompt },
+            }
+            issue_prompt()
+            return
+          end
+
+          self.session_id = nil
+          self:_ensure_session(current_file, function(ok_retry)
+            if ok_retry then
+              issue_prompt()
+            else
+              finalize_request()
+            end
+          end)
+          return
+        end
+        finalize_request()
+      end)
+    end
+
+    issue_prompt()
   end
 
   self:_ensure_session(current_file, function(ok)

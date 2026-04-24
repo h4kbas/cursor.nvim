@@ -21,6 +21,10 @@ function AppManager.new()
   self.session_store = nil
   self.session_store_path = nil
   self.current_session_id = nil
+  self.request_queue = {}
+  self.request_in_flight = false
+  self.current_request = nil
+  self.next_request_id = 1
   
   return self
 end
@@ -70,6 +74,7 @@ function AppManager:_create_session(name)
     id = id,
     name = name or ('Session ' .. os.date('%Y-%m-%d %H:%M')),
     updated_at = now,
+    acp_session_id = nil,
     state = {
       messages = {},
       last_sent_message = '',
@@ -95,6 +100,11 @@ function AppManager:_ensure_session_store()
         if ok_decode and type(decoded) == 'table' then
           if type(decoded.sessions) == 'table' then
             store.sessions = decoded.sessions
+            for _, session in ipairs(store.sessions) do
+              if type(session) == 'table' and session.acp_session_id == nil then
+                session.acp_session_id = nil
+              end
+            end
           end
           if type(decoded.current_session_id) == 'string' then
             store.current_session_id = decoded.current_session_id
@@ -144,18 +154,42 @@ function AppManager:_persist_current_session()
   if not session then
     return
   end
+  if self.cursor_manager and session then
+    session.acp_session_id = self.cursor_manager:get_active_session_id()
+  end
   session.state = self.chat_manager:get_state()
   session.updated_at = os.time()
   self:_save_session_store()
+end
+
+function AppManager:_sync_queue_display(update_window)
+  local session = self:_get_current_session()
+  self.window_manager:set_panel_state({
+    model = self.opts.model or 'auto',
+    session_name = session and session.name or nil,
+    affected_files = self.chat_manager:get_affected_files(),
+    current_request = self.current_request,
+    request_queue = self.request_queue,
+  })
+  if update_window and self.is_open then
+    self.window_manager:update_chat_display(self.chat_manager)
+  end
 end
 
 function AppManager:_load_current_session_into_chat()
   local session = self:_get_current_session()
   if not session then
     self.chat_manager:initialize()
+    if self.cursor_manager then
+      self.cursor_manager:set_active_session_id(nil)
+    end
     return
   end
+  if self.cursor_manager then
+    self.cursor_manager:set_active_session_id(session.acp_session_id)
+  end
   self.chat_manager:load_state(session.state or {})
+  self:_sync_queue_display(false)
 end
 
 function AppManager:new_session(name)
@@ -300,6 +334,7 @@ function AppManager:open_chat()
     self.chat_manager:add_affected_files(affected_files)
     self.chat_manager:upsert_activity_message(content)
     self:_persist_current_session()
+    self:_sync_queue_display(false)
     self.window_manager:update_chat_display(self.chat_manager)
   end)
   
@@ -309,6 +344,7 @@ function AppManager:open_chat()
   self:_ensure_session_store()
   self:_load_current_session_into_chat()
   self.is_open = true
+  self:_sync_queue_display(false)
   
   if self.binding_manager then
     self.binding_manager:register_all_bindings(self.window_manager)
@@ -337,7 +373,14 @@ function AppManager:handle_send_message(message_text)
     self.window_manager:focus_input()
   end)
   
-  self:send_message(message)
+  table.insert(self.request_queue, {
+    id = self.next_request_id,
+    message = message,
+  })
+  self.next_request_id = self.next_request_id + 1
+  self:_sync_queue_display(true)
+
+  self:_process_next_request()
 end
 
 function AppManager:close()
@@ -408,11 +451,17 @@ function AppManager:open_affected_file_under_cursor()
   end
 
   local current_buf = vim.api.nvim_get_current_buf()
-  if current_buf ~= self.window_manager.chat_bufnr then
+  local in_chat = current_buf == self.window_manager.chat_bufnr
+  local in_affected = self.window_manager.affected_bufnr and current_buf == self.window_manager.affected_bufnr
+  local in_queue = self.window_manager.queue_bufnr and current_buf == self.window_manager.queue_bufnr
+  if not in_chat and not in_affected and not in_queue then
     return false
   end
 
   local line = vim.api.nvim_get_current_line()
+  if line:match('^%-%s+%[') then
+    return false
+  end
   local path = line:match('^%-%s+(.+)$')
   if not path or path == '' then
     return false
@@ -447,18 +496,88 @@ function AppManager:open_affected_file_under_cursor()
   return true
 end
 
+function AppManager:cycle_focus_forward()
+  if not self.window_manager then
+    return
+  end
+
+  local current_win = vim.api.nvim_get_current_win()
+  local chat_win = self.window_manager.chat_winid
+  local affected_win = self.window_manager.affected_winid
+  local queue_win = self.window_manager.queue_winid
+  local input_win = self.window_manager.input_winid
+
+  local order = {
+    chat_win,
+    affected_win,
+    queue_win,
+    input_win,
+  }
+
+  local valid = {}
+  for _, winid in ipairs(order) do
+    if winid and vim.api.nvim_win_is_valid(winid) then
+      table.insert(valid, winid)
+    end
+  end
+
+  if #valid == 0 then
+    return
+  end
+
+  local idx = 0
+  for i, winid in ipairs(valid) do
+    if winid == current_win then
+      idx = i
+      break
+    end
+  end
+
+  local next_idx = 1
+  if idx > 0 then
+    next_idx = (idx % #valid) + 1
+  end
+  local target = valid[next_idx]
+
+  if target and vim.api.nvim_win_is_valid(target) then
+    vim.api.nvim_set_current_win(target)
+    if target == input_win then
+      vim.api.nvim_win_set_cursor(input_win, {1, 0})
+      vim.cmd('stopinsert')
+      vim.defer_fn(function()
+        vim.api.nvim_feedkeys('i', 'n', false)
+      end, 10)
+    else
+      vim.cmd('stopinsert')
+    end
+  end
+end
+
+
+function AppManager:_process_next_request()
+  if self.request_in_flight then
+    return
+  end
+
+  local next_item = table.remove(self.request_queue, 1)
+  if not next_item then
+    self.current_request = nil
+    self:_sync_queue_display(true)
+    return
+  end
+
+  self.current_request = next_item
+  self:_sync_queue_display(true)
+  self:send_message(next_item.message)
+end
 
 function AppManager:send_message(message)
-  local is_streaming = false
-  local last_response = ''
-  
+  self.request_in_flight = true
+
   self.chat_manager:set_status('processing')
   self.window_manager:update_chat_display(self.chat_manager)
   
   self.cursor_manager:send_chat_message(message, function(response, changes, streaming)
-    is_streaming = streaming or false
-    last_response = response
-    
     if streaming then
       self.chat_manager:set_status('streaming')
       self.chat_manager:set_streaming_response(response)
@@ -480,6 +599,11 @@ function AppManager:send_message(message)
       self:_persist_current_session()
       self.window_manager:update_chat_display(self.chat_manager)
       self.window_manager:focus_input()
+
+      self.request_in_flight = false
+      self.current_request = nil
+      self:_sync_queue_display(true)
+      self:_process_next_request()
     end
   end)
 end
@@ -489,6 +613,8 @@ function AppManager:stop_request()
   if self.cursor_manager then
     local stopped = self.cursor_manager:stop()
     if stopped then
+      self.request_in_flight = false
+      self.current_request = nil
       self.chat_manager:set_status('stopped')
       local current_response = self.chat_manager:get_streaming_response()
       if current_response and current_response ~= '' then
@@ -503,10 +629,62 @@ function AppManager:stop_request()
       end
       
       self.window_manager:focus_input()
+      self:_sync_queue_display(true)
+      self:_process_next_request()
     end
     return stopped
   end
   return false
+end
+
+function AppManager:_queue_index_from_current_line()
+  if not self.window_manager or not self.window_manager.chat_bufnr then
+    return nil
+  end
+
+  local current_buf = vim.api.nvim_get_current_buf()
+  local in_chat = current_buf == self.window_manager.chat_bufnr
+  local in_affected = self.window_manager.affected_bufnr and current_buf == self.window_manager.affected_bufnr
+  local in_queue = self.window_manager.queue_bufnr and current_buf == self.window_manager.queue_bufnr
+  if not in_chat and not in_affected and not in_queue then
+    return nil
+  end
+
+  local line = vim.api.nvim_get_current_line()
+  return tonumber(line:match('^%-%s+%[(%d+)%]%s+'))
+end
+
+function AppManager:cancel_queued_request_under_cursor()
+  local idx = self:_queue_index_from_current_line()
+  if not idx or idx < 1 or idx > #self.request_queue then
+    return false
+  end
+
+  table.remove(self.request_queue, idx)
+  self:_sync_queue_display(true)
+  return true
+end
+
+function AppManager:move_queued_request_up_under_cursor()
+  local idx = self:_queue_index_from_current_line()
+  if not idx or idx <= 1 or idx > #self.request_queue then
+    return false
+  end
+
+  self.request_queue[idx - 1], self.request_queue[idx] = self.request_queue[idx], self.request_queue[idx - 1]
+  self:_sync_queue_display(true)
+  return true
+end
+
+function AppManager:move_queued_request_down_under_cursor()
+  local idx = self:_queue_index_from_current_line()
+  if not idx or idx < 1 or idx >= #self.request_queue then
+    return false
+  end
+
+  self.request_queue[idx + 1], self.request_queue[idx] = self.request_queue[idx], self.request_queue[idx + 1]
+  self:_sync_queue_display(true)
+  return true
 end
 
 function AppManager:apply_changes()

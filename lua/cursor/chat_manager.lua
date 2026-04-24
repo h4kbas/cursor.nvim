@@ -223,15 +223,6 @@ function ChatManager:format_messages_for_display()
     end
   end
 
-  if #self.affected_files > 0 then
-    table.insert(formatted, '### Affected files')
-    table.insert(formatted, '')
-    for _, path in ipairs(self.affected_files) do
-      table.insert(formatted, '- ' .. path)
-    end
-    table.insert(formatted, '')
-  end
-  
   return formatted
 end
 

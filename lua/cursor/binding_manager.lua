@@ -11,6 +11,11 @@ function BindingManager.new(app_manager)
       close = "q",
       stop = "<C-c>",
       focus_toggle = "<C-]>",
+      open_item = "<CR>",
+      open_item_alt = "gf",
+      queue_cancel = "X",
+      queue_move_up = "<C-k>",
+      queue_move_down = "<C-j>",
     },
     diff = {
       apply = "a",
@@ -47,6 +52,8 @@ function BindingManager:register_chat_bindings(window_manager)
   local app_mgr = self.app_manager
   local input_bufnr = window_manager.input_bufnr
   local chat_bufnr = window_manager.chat_bufnr
+  local affected_bufnr = window_manager.affected_bufnr
+  local queue_bufnr = window_manager.queue_bufnr
 
   if not input_bufnr or not chat_bufnr then
     return
@@ -56,43 +63,90 @@ function BindingManager:register_chat_bindings(window_manager)
     app_mgr:close()
   end
 
-  if self.bindings.chat.close then
-    vim.keymap.set('n', self.bindings.chat.close, close_chat, {
-      buffer = chat_bufnr,
-      desc = "cursor chat: close",
-      silent = true,
-      noremap = true,
-    })
-  end
-
-  if self.bindings.chat.focus_toggle then
-    vim.keymap.set('n', self.bindings.chat.focus_toggle, function()
-      window_manager:focus_input()
-    end, {
-      buffer = chat_bufnr,
-      desc = "cursor chat: focus input",
-      silent = true,
-      noremap = true,
-    })
-  end
-
   local function open_affected_file()
     app_mgr:open_affected_file_under_cursor()
   end
 
-  vim.keymap.set('n', '<CR>', open_affected_file, {
-    buffer = chat_bufnr,
-    desc = "cursor chat: open affected file",
-    silent = true,
-    noremap = true,
-  })
+  local function register_history_bindings(bufnr)
+    if not bufnr then
+      return
+    end
 
-  vim.keymap.set('n', 'gf', open_affected_file, {
-    buffer = chat_bufnr,
-    desc = "cursor chat: go to affected file",
-    silent = true,
-    noremap = true,
-  })
+    if self.bindings.chat.close then
+      vim.keymap.set('n', self.bindings.chat.close, close_chat, {
+        buffer = bufnr,
+        desc = "cursor chat: close",
+        silent = true,
+        noremap = true,
+      })
+    end
+
+    if self.bindings.chat.focus_toggle then
+      vim.keymap.set('n', self.bindings.chat.focus_toggle, function()
+        app_mgr:cycle_focus_forward()
+      end, {
+        buffer = bufnr,
+        desc = "cursor chat: cycle focus",
+        silent = true,
+        noremap = true,
+      })
+    end
+
+    if self.bindings.chat.open_item then
+      vim.keymap.set('n', self.bindings.chat.open_item, open_affected_file, {
+        buffer = bufnr,
+        desc = "cursor chat: open item",
+        silent = true,
+        noremap = true,
+      })
+    end
+
+    if self.bindings.chat.open_item_alt then
+      vim.keymap.set('n', self.bindings.chat.open_item_alt, open_affected_file, {
+        buffer = bufnr,
+        desc = "cursor chat: open item alt",
+        silent = true,
+        noremap = true,
+      })
+    end
+
+    if self.bindings.chat.queue_cancel then
+      vim.keymap.set('n', self.bindings.chat.queue_cancel, function()
+        app_mgr:cancel_queued_request_under_cursor()
+      end, {
+        buffer = bufnr,
+        desc = "cursor chat: cancel queued request",
+        silent = true,
+        noremap = true,
+      })
+    end
+
+    if self.bindings.chat.queue_move_up then
+      vim.keymap.set('n', self.bindings.chat.queue_move_up, function()
+        app_mgr:move_queued_request_up_under_cursor()
+      end, {
+        buffer = bufnr,
+        desc = "cursor chat: move queued request up",
+        silent = true,
+        noremap = true,
+      })
+    end
+
+    if self.bindings.chat.queue_move_down then
+      vim.keymap.set('n', self.bindings.chat.queue_move_down, function()
+        app_mgr:move_queued_request_down_under_cursor()
+      end, {
+        buffer = bufnr,
+        desc = "cursor chat: move queued request down",
+        silent = true,
+        noremap = true,
+      })
+    end
+  end
+
+  register_history_bindings(chat_bufnr)
+  register_history_bindings(affected_bufnr)
+  register_history_bindings(queue_bufnr)
 
   vim.keymap.set('i', '<CR>', function()
     local message = window_manager:get_user_input()
@@ -124,10 +178,10 @@ function BindingManager:register_chat_bindings(window_manager)
 
   if self.bindings.chat.focus_toggle then
     vim.keymap.set('n', self.bindings.chat.focus_toggle, function()
-      window_manager:focus_chat()
+      app_mgr:cycle_focus_forward()
     end, {
       buffer = input_bufnr,
-      desc = "cursor chat: focus history",
+      desc = "cursor chat: cycle focus",
       silent = true,
       noremap = true,
     })
@@ -135,11 +189,11 @@ function BindingManager:register_chat_bindings(window_manager)
     vim.keymap.set('i', self.bindings.chat.focus_toggle, function()
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'n', false)
       vim.schedule(function()
-        window_manager:focus_chat()
+        app_mgr:cycle_focus_forward()
       end)
     end, {
       buffer = input_bufnr,
-      desc = "cursor chat: focus history",
+      desc = "cursor chat: cycle focus",
       silent = true,
       noremap = true,
     })
