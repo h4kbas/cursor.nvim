@@ -40,7 +40,7 @@ function Commands:register()
   vim.api.nvim_create_user_command("CursorSessionManage", function()
     self.app_manager:manage_sessions()
   end, {
-    desc = "Manage cursor chat sessions",
+    desc = "Manage cursor sessions (new/switch/rename/delete)",
   })
 
   vim.api.nvim_create_user_command("CursorSessionDelete", function(opts)
@@ -65,6 +65,25 @@ function Commands:register()
   end, {
     desc = "Switch cursor chat session",
     nargs = "?",
+  })
+
+  vim.api.nvim_create_user_command("CursorSessionRename", function(opts)
+    local args = opts.args or ''
+    local id, name = args:match('^(%S+)%s+(.+)$')
+    if not id or not name then
+      vim.notify('Usage: :CursorSessionRename <session_id> <new_name>', vim.log.levels.INFO)
+      return
+    end
+    self.app_manager:rename_session(id, name)
+  end, {
+    desc = "Rename cursor chat session",
+    nargs = "+",
+  })
+
+  vim.api.nvim_create_user_command("CursorCheckpointRevert", function()
+    self.app_manager:revert_last_checkpoint()
+  end, {
+    desc = "Revert last cursor checkpointed changes",
   })
 end
 

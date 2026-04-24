@@ -31,6 +31,8 @@ function CursorManager.new(opts)
   self.terminals = {}
   self.on_permission_request = opts.on_permission_request
   self.on_activity_update = opts.on_activity_update
+  self.on_file_write = opts.on_file_write
+  self.on_file_read = opts.on_file_read
   self._last_activity_line = nil
   self._permission_queue = {}
   self._permission_in_progress = false
@@ -215,6 +217,11 @@ function CursorManager:_handle_fs_read_text_file(id, params)
     return
   end
 
+  local on_file_read = self.on_file_read
+  if type(on_file_read) == 'function' then
+    pcall(on_file_read, path)
+  end
+
   local content_lines = nil
 
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
@@ -277,6 +284,11 @@ function CursorManager:_handle_fs_write_text_file(id, params)
   if not path or path == '' then
     self:_send_response(id, vim.NIL)
     return
+  end
+
+  local on_file_write = self.on_file_write
+  if type(on_file_write) == 'function' then
+    pcall(on_file_write, path)
   end
 
   local lines = {}
@@ -773,13 +785,63 @@ end
 function CursorManager:_extract_activity_paths(update)
   local paths = {}
   local seen = {}
+  local function is_url_like(value)
+    if type(value) ~= 'string' or value == '' then
+      return false
+    end
+    if value:match('^https?://') or value:match('^//[%w%-]+%.') then
+      return true
+    end
+    if value:match('^file://https?://') or value:match('://https?://') then
+      return true
+    end
+    if value:match('https?://') then
+      return true
+    end
+    return false
+  end
 
   local function add_path(value)
-    if type(value) ~= 'string' or value == '' or seen[value] then
+    if type(value) ~= 'string' or value == '' then
+      return
+    end
+    value = value:gsub('^%s+', ''):gsub('%s+$', '')
+    value = value:gsub('^["\']+', ''):gsub('["\']+$', '')
+    value = value:gsub('[,;:!?)%]}]+$', '')
+    if value == '' or seen[value] then
+      return
+    end
+    if is_url_like(value) then
       return
     end
     seen[value] = true
     table.insert(paths, value)
+  end
+
+  local function add_paths_from_text(text)
+    if type(text) ~= 'string' or text == '' then
+      return
+    end
+
+    -- Absolute/file URI paths
+    for raw in text:gmatch('file://[%w%._%-%/%s]+') do
+      add_path(raw)
+    end
+    for raw in text:gmatch('/[%w%._%-%/%s]+%.%w+') do
+      add_path(raw)
+    end
+
+    -- Relative paths commonly seen in tool command strings
+    for raw in text:gmatch('%.?/[%w%._%-%/%s]+%.%w+') do
+      add_path(raw)
+    end
+    for raw in text:gmatch('[%w%._%-/]+%.%w+') do
+      if raw:find('/') then
+        if not raw:match('^[%w%-]+%.%w+') and not raw:match('^//') then
+          add_path(raw)
+        end
+      end
+    end
   end
 
   local function walk(tbl, depth)
@@ -797,12 +859,16 @@ function CursorManager:_extract_activity_paths(update)
       local value = tbl[key]
       if type(value) == 'table' then
         walk(value, depth + 1)
+      elseif type(value) == 'string' then
+        add_paths_from_text(value)
       end
     end
 
     for _, value in pairs(tbl) do
       if type(value) == 'table' then
         walk(value, depth + 1)
+      elseif type(value) == 'string' then
+        add_paths_from_text(value)
       end
     end
   end
@@ -1177,6 +1243,22 @@ function CursorManager:set_activity_update_handler(handler)
     self.on_activity_update = handler
   else
     self.on_activity_update = nil
+  end
+end
+
+function CursorManager:set_file_write_handler(handler)
+  if type(handler) == 'function' then
+    self.on_file_write = handler
+  else
+    self.on_file_write = nil
+  end
+end
+
+function CursorManager:set_file_read_handler(handler)
+  if type(handler) == 'function' then
+    self.on_file_read = handler
+  else
+    self.on_file_read = nil
   end
 end
 

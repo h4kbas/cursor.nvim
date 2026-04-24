@@ -21,10 +21,14 @@ function AppManager.new()
   self.session_store = nil
   self.session_store_path = nil
   self.current_session_id = nil
+  self.session_root = vim.fn.getcwd()
   self.request_queue = {}
   self.request_in_flight = false
   self.current_request = nil
   self.next_request_id = 1
+  self.next_checkpoint_id = 1
+  self.current_checkpoint = nil
+  self.checkpoints = {}
   
   return self
 end
@@ -40,10 +44,11 @@ function AppManager:setup_commands()
 end
 
 function AppManager:_get_project_root()
-  if self.cursor_manager then
-    return self.cursor_manager:get_project_root(vim.fn.getcwd())
+  if self.session_root and self.session_root ~= '' then
+    return self.session_root
   end
-  return vim.fn.getcwd()
+  self.session_root = vim.fn.getcwd()
+  return self.session_root
 end
 
 function AppManager:_get_session_store_path()
@@ -75,12 +80,134 @@ function AppManager:_create_session(name)
     name = name or ('Session ' .. os.date('%Y-%m-%d %H:%M')),
     updated_at = now,
     acp_session_id = nil,
+    checkpoints = {},
     state = {
       messages = {},
       last_sent_message = '',
       affected_files = {},
     },
   }
+end
+
+function AppManager:_base64_encode_bytes(bytes)
+  if not bytes or bytes == '' then
+    return ''
+  end
+  if vim.base64 and vim.base64.encode then
+    local ok, encoded = pcall(vim.base64.encode, bytes)
+    if ok and encoded then
+      return encoded
+    end
+  end
+
+  local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  return ((bytes:gsub('.', function(x)
+    local r, byte = '', x:byte()
+    for i = 8, 1, -1 do
+      r = r .. (byte % 2 ^ i - byte % 2 ^ (i - 1) > 0 and '1' or '0')
+    end
+    return r
+  end) .. '0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+    if #x < 6 then
+      return ''
+    end
+    local c = 0
+    for i = 1, 6 do
+      c = c + (x:sub(i, i) == '1' and 2 ^ (6 - i) or 0)
+    end
+    return b:sub(c + 1, c + 1)
+  end) .. ({ '', '==', '=' })[#bytes % 3 + 1])
+end
+
+function AppManager:_base64_decode_bytes(text)
+  if not text or text == '' then
+    return ''
+  end
+  if vim.base64 and vim.base64.decode then
+    local ok, decoded = pcall(vim.base64.decode, text)
+    if ok and decoded then
+      return decoded
+    end
+  end
+
+  local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  text = text:gsub('[^' .. b .. '=]', '')
+  return (text:gsub('.', function(x)
+    if x == '=' then
+      return ''
+    end
+    local f = (b:find(x, 1, true) or 1) - 1
+    local r = ''
+    for i = 6, 1, -1 do
+      r = r .. (f % 2 ^ i - f % 2 ^ (i - 1) > 0 and '1' or '0')
+    end
+    return r
+  end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+    if #x ~= 8 then
+      return ''
+    end
+    local c = 0
+    for i = 1, 8 do
+      c = c + (x:sub(i, i) == '1' and 2 ^ (8 - i) or 0)
+    end
+    return string.char(c)
+  end))
+end
+
+function AppManager:_serialize_checkpoints()
+  local out = {}
+  for _, cp in ipairs(self.checkpoints or {}) do
+    local files = {}
+    if type(cp.files) == 'table' then
+      for path, entry in pairs(cp.files) do
+        files[path] = {
+          exists = entry.exists and true or false,
+          content_b64 = entry.content and self:_base64_encode_bytes(entry.content) or '',
+        }
+      end
+    end
+    table.insert(out, {
+      created_at = cp.created_at,
+      user_message = cp.user_message,
+      order = cp.order or {},
+      files = files,
+      chat_state_before = cp.chat_state_before,
+      chat_state_after = cp.chat_state_after,
+    })
+  end
+  return out
+end
+
+function AppManager:_deserialize_checkpoints(raw)
+  local checkpoints = {}
+  if type(raw) ~= 'table' then
+    return checkpoints
+  end
+
+  for _, cp in ipairs(raw) do
+    if type(cp) == 'table' then
+      local files = {}
+      if type(cp.files) == 'table' then
+        for path, entry in pairs(cp.files) do
+          if type(path) == 'string' and type(entry) == 'table' then
+            files[path] = {
+              exists = entry.exists and true or false,
+              content = self:_base64_decode_bytes(entry.content_b64 or ''),
+            }
+          end
+        end
+      end
+      table.insert(checkpoints, {
+        created_at = cp.created_at,
+        user_message = cp.user_message or '',
+        order = cp.order or {},
+        files = files,
+        chat_state_before = cp.chat_state_before,
+        chat_state_after = cp.chat_state_after,
+      })
+    end
+  end
+  return checkpoints
 end
 
 function AppManager:_ensure_session_store()
@@ -157,6 +284,7 @@ function AppManager:_persist_current_session()
   if self.cursor_manager and session then
     session.acp_session_id = self.cursor_manager:get_active_session_id()
   end
+  session.checkpoints = self:_serialize_checkpoints()
   session.state = self.chat_manager:get_state()
   session.updated_at = os.time()
   self:_save_session_store()
@@ -176,6 +304,204 @@ function AppManager:_sync_queue_display(update_window)
   end
 end
 
+function AppManager:_read_file_raw(path)
+  local f = io.open(path, 'rb')
+  if not f then
+    return nil
+  end
+  local content = f:read('*a')
+  f:close()
+  return content
+end
+
+function AppManager:_write_file_raw(path, content)
+  local f = io.open(path, 'wb')
+  if not f then
+    return false
+  end
+  f:write(content or '')
+  f:close()
+  return true
+end
+
+function AppManager:_set_loaded_buffer_content(path, content)
+  local normalized_path = self:_normalize_checkpoint_path(path)
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and vim.api.nvim_buf_get_name(bufnr) == normalized_path then
+      local lines = {}
+      if content and content ~= '' then
+        lines = vim.split(content, '\n', { plain = true })
+        if #lines > 0 and lines[#lines] == '' then
+          table.remove(lines, #lines)
+        end
+      end
+      vim.api.nvim_buf_set_option(bufnr, 'modifiable', true)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+      vim.api.nvim_buf_set_option(bufnr, 'modified', false)
+    end
+  end
+end
+
+function AppManager:_create_checkpoint(message, chat_state_before)
+  local checkpoint = {
+    id = self.next_checkpoint_id,
+    created_at = os.time(),
+    user_message = message or '',
+    chat_state_before = chat_state_before or self.chat_manager:get_state(),
+    files = {},
+    order = {},
+  }
+  self.next_checkpoint_id = self.next_checkpoint_id + 1
+  return checkpoint
+end
+
+function AppManager:_normalize_checkpoint_path(path)
+  if type(path) ~= 'string' or path == '' then
+    return nil
+  end
+
+  local normalized = path:gsub('^file://', '')
+  if normalized:sub(1, 1) ~= '/' then
+    local base = self:_get_project_root() or vim.fn.getcwd()
+    normalized = base .. '/' .. normalized
+  end
+  normalized = vim.fn.fnamemodify(normalized, ':p')
+  normalized = normalized:gsub('/+$', '')
+  return normalized
+end
+
+function AppManager:_filter_project_local_paths(paths)
+  local filtered = {}
+  local seen = {}
+  if type(paths) ~= 'table' then
+    return filtered
+  end
+
+  local root = self:_get_project_root() or vim.fn.getcwd()
+  root = vim.fn.fnamemodify(root, ':p'):gsub('/+$', '')
+
+  for _, path in ipairs(paths) do
+    local normalized = self:_normalize_checkpoint_path(path)
+    if normalized and normalized:sub(1, #root) == root then
+      if not seen[normalized] then
+        seen[normalized] = true
+        table.insert(filtered, normalized)
+      end
+    end
+  end
+  return filtered
+end
+
+function AppManager:_start_checkpoint_from_item(item)
+  if type(item) == 'table' and type(item.checkpoint) == 'table' then
+    self.current_checkpoint = item.checkpoint
+    return
+  end
+  local message = type(item) == 'table' and item.message or item
+  self.current_checkpoint = self:_create_checkpoint(message, self.chat_manager:get_state())
+end
+
+function AppManager:_capture_checkpoint_files(paths)
+  if not self.current_checkpoint or type(paths) ~= 'table' then
+    return
+  end
+
+  for _, path in ipairs(paths) do
+    local normalized = self:_normalize_checkpoint_path(path)
+    if normalized and vim.fn.isdirectory(normalized) ~= 1 then
+      if self.current_checkpoint.files[normalized] == nil then
+        local exists = vim.fn.filereadable(normalized) == 1
+        local content = exists and self:_read_file_raw(normalized) or nil
+        self.current_checkpoint.files[normalized] = {
+          exists = exists,
+          content = content,
+        }
+        table.insert(self.current_checkpoint.order, normalized)
+      end
+    end
+  end
+end
+
+function AppManager:_finalize_checkpoint()
+  local cp = self.current_checkpoint
+  if not cp then
+    return
+  end
+  local fallback_paths = {}
+  local affected = self.chat_manager:get_affected_files() or {}
+  for _, p in ipairs(affected) do
+    table.insert(fallback_paths, p)
+  end
+  local changes = self.chat_manager:get_last_changes() or {}
+  for _, ch in ipairs(changes) do
+    if type(ch) == 'table' and type(ch.file) == 'string' and ch.file ~= '' then
+      table.insert(fallback_paths, ch.file)
+    end
+  end
+  self.current_checkpoint = cp
+  self:_capture_checkpoint_files(fallback_paths)
+  self.current_checkpoint = nil
+
+  cp.chat_state_after = self.chat_manager:get_state()
+  table.insert(self.checkpoints, 1, cp)
+  local max_items = self.opts.checkpoint_history_limit or 20
+  while #self.checkpoints > max_items do
+    table.remove(self.checkpoints)
+  end
+  self:_persist_current_session()
+end
+
+function AppManager:revert_last_checkpoint()
+  if #self.checkpoints <= 1 then
+    vim.notify('Cannot revert the initial checkpoint.', vim.log.levels.INFO)
+    return false
+  end
+
+  local cp = self.checkpoints[1]
+  if not cp then
+    vim.notify('No checkpoint to revert.', vim.log.levels.INFO)
+    return false
+  end
+
+  local restore_ok = true
+  for _, path in ipairs(cp.order or {}) do
+    local entry = cp.files[path]
+    if entry then
+      if entry.exists then
+        local write_ok = self:_write_file_raw(path, entry.content or '')
+        if not write_ok then
+          restore_ok = false
+        end
+        self:_set_loaded_buffer_content(path, entry.content or '')
+      else
+        local deleted = vim.fn.delete(path)
+        if deleted ~= 0 and vim.fn.filereadable(path) == 1 then
+          restore_ok = false
+        end
+        self:_set_loaded_buffer_content(path, '')
+      end
+    end
+  end
+
+  if not restore_ok then
+    vim.notify('Checkpoint restore was incomplete. Keeping checkpoint for retry.', vim.log.levels.WARN)
+    return false
+  end
+
+  table.remove(self.checkpoints, 1)
+
+  if cp.chat_state_before then
+    self.chat_manager:load_state(cp.chat_state_before)
+  else
+    self.chat_manager:add_message('assistant', 'Reverted checkpoint for: ' .. (cp.user_message or 'previous request'))
+  end
+  self:_sync_queue_display(false)
+  self:_persist_current_session()
+  self.window_manager:update_chat_display(self.chat_manager)
+  vim.notify('Reverted last checkpoint.', vim.log.levels.INFO)
+  return true
+end
+
 function AppManager:_load_current_session_into_chat()
   local session = self:_get_current_session()
   if not session then
@@ -183,11 +509,13 @@ function AppManager:_load_current_session_into_chat()
     if self.cursor_manager then
       self.cursor_manager:set_active_session_id(nil)
     end
+    self.checkpoints = {}
     return
   end
   if self.cursor_manager then
     self.cursor_manager:set_active_session_id(session.acp_session_id)
   end
+  self.checkpoints = self:_deserialize_checkpoints(session.checkpoints)
   self.chat_manager:load_state(session.state or {})
   self:_sync_queue_display(false)
 end
@@ -273,22 +601,53 @@ function AppManager:list_sessions()
   return self.session_store.sessions, self.current_session_id
 end
 
+function AppManager:rename_session(session_id, new_name)
+  if type(session_id) ~= 'string' or session_id == '' then
+    return false
+  end
+  if type(new_name) ~= 'string' or new_name:match('^%s*$') then
+    return false
+  end
+  self:_ensure_session_store()
+  for _, session in ipairs(self.session_store.sessions) do
+    if session.id == session_id then
+      session.name = new_name:gsub('^%s+', ''):gsub('%s+$', '')
+      session.updated_at = os.time()
+      self:_save_session_store()
+      if self.is_open then
+        self:_sync_queue_display(false)
+        self.window_manager:update_chat_display(self.chat_manager)
+      end
+      return true
+    end
+  end
+  return false
+end
+
 function AppManager:manage_sessions()
   self:_ensure_session_store()
   self:_persist_current_session()
 
   local sessions, current_id = self:list_sessions()
+  local sorted = vim.deepcopy(sessions)
+  table.sort(sorted, function(a, b)
+    local at = (a and a.updated_at) or 0
+    local bt = (b and b.updated_at) or 0
+    return at > bt
+  end)
+
   local entries = {}
   local map = {}
 
   table.insert(entries, '+ New session')
   map['+ New session'] = { action = 'new' }
 
-  for _, session in ipairs(sessions) do
+  for _, session in ipairs(sorted) do
     local prefix = session.id == current_id and '* ' or '  '
-    local label = prefix .. (session.name or session.id) .. ' [' .. session.id .. ']'
+    local ts = session.updated_at and os.date('%Y-%m-%d %H:%M', session.updated_at) or 'unknown'
+    local label = prefix .. (session.name or session.id) .. ' [' .. session.id .. '] (' .. ts .. ')'
     table.insert(entries, label)
-    map[label] = { action = 'switch', id = session.id }
+    map[label] = { action = 'session', id = session.id, name = session.name or session.id }
   end
 
   vim.ui.select(entries, {
@@ -310,8 +669,35 @@ function AppManager:manage_sessions()
       return
     end
 
-    if selected.action == 'switch' and selected.id then
-      self:switch_session(selected.id)
+    if selected.action == 'session' and selected.id then
+      vim.ui.select({
+        'Switch',
+        'Rename',
+        'Delete',
+      }, {
+        prompt = 'Session: ' .. (selected.name or selected.id),
+      }, function(action_choice)
+        if action_choice == 'Switch' then
+          self:switch_session(selected.id)
+          return
+        end
+
+        if action_choice == 'Rename' then
+          vim.ui.input({
+            prompt = 'New session name: ',
+            default = selected.name or '',
+          }, function(new_name)
+            if new_name and new_name ~= '' then
+              self:rename_session(selected.id, new_name)
+            end
+          end)
+          return
+        end
+
+        if action_choice == 'Delete' then
+          self:delete_session(selected.id)
+        end
+      end)
     end
   end)
 end
@@ -331,11 +717,24 @@ function AppManager:open_chat()
     self.window_manager:update_chat_display(self.chat_manager)
   end)
   self.cursor_manager:set_activity_update_handler(function(content, _, affected_files)
-    self.chat_manager:add_affected_files(affected_files)
+    local local_paths = self:_filter_project_local_paths(affected_files or {})
+    self:_capture_checkpoint_files(local_paths)
+    self.chat_manager:add_affected_files(local_paths)
     self.chat_manager:upsert_activity_message(content)
     self:_persist_current_session()
     self:_sync_queue_display(false)
     self.window_manager:update_chat_display(self.chat_manager)
+  end)
+  self.cursor_manager:set_file_write_handler(function(path)
+    local local_paths = self:_filter_project_local_paths({ path })
+    self:_capture_checkpoint_files(local_paths)
+    self.chat_manager:add_affected_files(local_paths)
+    self:_persist_current_session()
+    self:_sync_queue_display(false)
+  end)
+  self.cursor_manager:set_file_read_handler(function(path)
+    local local_paths = self:_filter_project_local_paths({ path })
+    self:_capture_checkpoint_files(local_paths)
   end)
   
   self.window_manager.opts = self.opts
@@ -362,15 +761,41 @@ function AppManager:handle_send_message(message_text)
   if not message or message == '' or message:match('^%s*$') then
     return
   end
+  local checkpoint_before = self.chat_manager:get_state()
+  local checkpoint = self:_create_checkpoint(message, checkpoint_before)
+  local seed_paths = {}
+  local seen_seed = {}
+  local function add_seed(path)
+    if type(path) ~= 'string' or path == '' then
+      return
+    end
+    local normalized = self:_normalize_checkpoint_path(path)
+    if not normalized or seen_seed[normalized] then
+      return
+    end
+    if vim.fn.filereadable(normalized) ~= 1 then
+      return
+    end
+    seen_seed[normalized] = true
+    table.insert(seed_paths, normalized)
+  end
+
+  local alt_file = vim.fn.expand('#:p')
+  add_seed(alt_file)
+  local current_file = vim.api.nvim_buf_get_name(0)
+  add_seed(current_file)
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local path = vim.api.nvim_buf_get_name(bufnr)
+      add_seed(path)
+    end
+  end
   local conversation_context = self.chat_manager:get_conversation_context(
     self.opts.context_max_messages or 40,
     self.opts.context_max_chars or 12000
   )
   
-  self.chat_manager:set_last_sent_message(message)
-  self.chat_manager:clear_affected_files()
-  self.chat_manager:add_message('user', message)
-  self:_persist_current_session()
   self.window_manager:clear_input()
   self.window_manager:update_chat_display(self.chat_manager)
   vim.schedule(function()
@@ -381,6 +806,9 @@ function AppManager:handle_send_message(message_text)
     id = self.next_request_id,
     message = message,
     conversation_context = conversation_context,
+    checkpoint_before = checkpoint_before,
+    checkpoint = checkpoint,
+    checkpoint_seed_paths = seed_paths,
   })
   self.next_request_id = self.next_request_id + 1
   self:_sync_queue_display(true)
@@ -579,12 +1007,28 @@ end
 function AppManager:send_message(message_or_item)
   local message = message_or_item
   local conversation_context = ''
+  local checkpoint_seed_paths = {}
   if type(message_or_item) == 'table' then
     message = message_or_item.message
     conversation_context = message_or_item.conversation_context or ''
+    checkpoint_seed_paths = message_or_item.checkpoint_seed_paths or {}
   end
 
   self.request_in_flight = true
+  self.chat_manager:set_last_sent_message(message)
+  self.chat_manager:add_message('user', message)
+  self:_persist_current_session()
+  self:_start_checkpoint_from_item(message_or_item)
+  self:_capture_checkpoint_files(checkpoint_seed_paths)
+  self:_capture_checkpoint_files(self.chat_manager:get_affected_files() or {})
+  local existing_changes = self.chat_manager:get_last_changes() or {}
+  local existing_change_files = {}
+  for _, ch in ipairs(existing_changes) do
+    if type(ch) == 'table' and type(ch.file) == 'string' and ch.file ~= '' then
+      table.insert(existing_change_files, ch.file)
+    end
+  end
+  self:_capture_checkpoint_files(existing_change_files)
 
   self.chat_manager:set_status('processing')
   self.window_manager:update_chat_display(self.chat_manager)
@@ -614,6 +1058,7 @@ function AppManager:send_message(message_or_item)
 
       self.request_in_flight = false
       self.current_request = nil
+      self:_finalize_checkpoint()
       self:_sync_queue_display(true)
       self:_process_next_request()
     end
@@ -629,6 +1074,7 @@ function AppManager:stop_request()
     if stopped then
       self.request_in_flight = false
       self.current_request = nil
+      self:_finalize_checkpoint()
       self.chat_manager:set_status('stopped')
       local current_response = self.chat_manager:get_streaming_response()
       if current_response and current_response ~= '' then

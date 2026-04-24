@@ -26,6 +26,7 @@ A Neovim plugin that connects Neovim to Cursor's agent via **ACP (Agent Client P
 - **Status Indicators**: Lightweight status line in the chat buffer showing whether the agent is idle, processing, streaming, or stopped.
 - **Project-Persistent Sessions**: Chat history is persisted per project, with support for multiple sessions and session switching.
 - **Real Session Mapping (UI <-> ACP)**: Each UI session stores its own backend ACP session binding, so switching sessions also switches backend context.
+- **Checkpoint Revert**: Each request creates a checkpoint so you can revert the latest request's file + chat/session state.
 - **Configurable Chat Layout & Bindings**: `chat_width` and bindings can be customized from `require('cursor').setup(...)` to match your Neovim UI preferences.
 - **Cursor CLI Integration**: Relies on the official Cursor CLI (`agent`) so you use the same models, settings, and MCP configuration as in Cursor desktop.
 
@@ -37,6 +38,9 @@ Using lazy.nvim:
 require('cursor').setup({
   chat_width = 50,                            -- Width of chat window
   model = 'auto',                             -- Model to use (optional, default: 'auto')
+  context_max_messages = 40,                  -- Persisted conversation messages included in prompt context
+  context_max_chars = 12000,                  -- Max conversation context chars included in prompt
+  checkpoint_history_limit = 20,              -- Max stored checkpoints per session
   ui = {
     input_height = 3,                         -- Input panel height
     affected_height = 4,                      -- Affected Files panel height
@@ -80,15 +84,25 @@ require('cursor').setup({
 - `ui.auto_hide_affected_when_empty`: hide affected files panel when empty
 - `ui.auto_hide_queue_when_empty`: hide queue panel when empty
 
+### Other Options
+
+- `context_max_messages`: max persisted messages injected as context each request
+- `context_max_chars`: max persisted context size (characters)
+- `checkpoint_history_limit`: max checkpoint entries kept per session
+
 ## Commands
 
 - `:CursorChat` - Open chat window
 - `:CursorClose` - Close chat window
 - `:CursorStop` - Stop current request
-- `:CursorSessionManage` - Open session picker (new/switch)
+- `:CursorSessionManage` - Open session manager (new/switch/rename/delete)
 - `:CursorSessionNew [name]` - Create and switch to a new session
 - `:CursorSessionSwitch [session_id]` - Switch session (without args opens picker)
 - `:CursorSessionDelete [session_id]` - Delete session (without args deletes current)
+- `:CursorSessionRename <session_id> <new_name>` - Rename a session
+- `:CursorCheckpointRevert` - Revert file changes from the last checkpointed request
+
+`CursorCheckpointRevert` reverts the latest checkpointed request, but keeps the initial/base checkpoint as non-revertable for consistency.
 
 ## Default Keybindings
 
@@ -108,3 +122,4 @@ require('cursor').setup({
 **Prerequisites**: 
 - Neovim 0.7+
 - Cursor CLI installed ([Cursor CLI](https://cursor.com/blog/cli)) with `agent` available in `PATH`. The plugin uses your existing Cursor account/settings.
+
