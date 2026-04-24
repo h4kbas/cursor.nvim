@@ -10,6 +10,7 @@ function ChatManager.new()
   self.streaming_response = ''
   self.status = 'idle'
   self.last_sent_message = ''
+  self.affected_files = {}
   
   return self
 end
@@ -19,12 +20,14 @@ function ChatManager:initialize()
   self.last_changes = {}
   self.input_buffer = {}
   self.status = 'idle'
+  self.affected_files = {}
 end
 
 function ChatManager:cleanup()
   self.messages = {}
   self.last_changes = {}
   self.input_buffer = {}
+  self.affected_files = {}
 end
 
 function ChatManager:add_message(role, content)
@@ -119,6 +122,32 @@ function ChatManager:get_last_sent_message()
   return self.last_sent_message
 end
 
+function ChatManager:add_affected_files(paths)
+  if type(paths) ~= 'table' then
+    return
+  end
+
+  local seen = {}
+  for _, existing in ipairs(self.affected_files) do
+    seen[existing] = true
+  end
+
+  for _, path in ipairs(paths) do
+    if type(path) == 'string' and path ~= '' and not seen[path] then
+      table.insert(self.affected_files, path)
+      seen[path] = true
+    end
+  end
+end
+
+function ChatManager:clear_affected_files()
+  self.affected_files = {}
+end
+
+function ChatManager:get_affected_files()
+  return self.affected_files
+end
+
 function ChatManager:format_messages_for_display()
   local formatted = {}
   
@@ -162,6 +191,15 @@ function ChatManager:format_messages_for_display()
       table.insert(formatted, '---')
       table.insert(formatted, '')
     end
+  end
+
+  if #self.affected_files > 0 then
+    table.insert(formatted, '### Affected files')
+    table.insert(formatted, '')
+    for _, path in ipairs(self.affected_files) do
+      table.insert(formatted, '- ' .. path)
+    end
+    table.insert(formatted, '')
   end
   
   return formatted

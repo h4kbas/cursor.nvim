@@ -64,6 +64,24 @@ function BindingManager:register_chat_bindings(window_manager)
     })
   end
 
+  local function open_affected_file()
+    app_mgr:open_affected_file_under_cursor()
+  end
+
+  vim.keymap.set('n', '<CR>', open_affected_file, {
+    buffer = chat_bufnr,
+    desc = "cursor chat: open affected file",
+    silent = true,
+    noremap = true,
+  })
+
+  vim.keymap.set('n', 'gf', open_affected_file, {
+    buffer = chat_bufnr,
+    desc = "cursor chat: go to affected file",
+    silent = true,
+    noremap = true,
+  })
+
   vim.keymap.set('i', '<CR>', function()
     local message = window_manager:get_user_input()
     

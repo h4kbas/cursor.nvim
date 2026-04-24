@@ -761,10 +761,52 @@ function CursorManager:_notify_activity_update(update)
     return
   end
   self._last_activity_line = line
+  local affected_files = self:_extract_activity_paths(update)
 
   vim.schedule(function()
-    cb(line, update)
+    cb(line, update, affected_files)
   end)
+end
+
+function CursorManager:_extract_activity_paths(update)
+  local paths = {}
+  local seen = {}
+
+  local function add_path(value)
+    if type(value) ~= 'string' or value == '' or seen[value] then
+      return
+    end
+    seen[value] = true
+    table.insert(paths, value)
+  end
+
+  local function walk(tbl, depth)
+    if type(tbl) ~= 'table' or depth > 5 then
+      return
+    end
+
+    add_path(tbl.path)
+    add_path(tbl.file)
+    add_path(tbl.filePath)
+    add_path(tbl.target_file)
+    add_path(tbl.targetPath)
+
+    for _, key in ipairs({ 'params', 'arguments', 'args', 'toolCall', 'tool_call', 'content', 'changes' }) do
+      local value = tbl[key]
+      if type(value) == 'table' then
+        walk(value, depth + 1)
+      end
+    end
+
+    for _, value in pairs(tbl) do
+      if type(value) == 'table' then
+        walk(value, depth + 1)
+      end
+    end
+  end
+
+  walk(update, 0)
+  return paths
 end
 
 function CursorManager:_handle_request_permission(id, params)

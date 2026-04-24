@@ -45,7 +45,8 @@ function AppManager:open_chat()
     self.chat_manager:add_message('assistant', content)
     self.window_manager:update_chat_display(self.chat_manager)
   end)
-  self.cursor_manager:set_activity_update_handler(function(content)
+  self.cursor_manager:set_activity_update_handler(function(content, _, affected_files)
+    self.chat_manager:add_affected_files(affected_files)
     self.chat_manager:upsert_activity_message(content)
     self.window_manager:update_chat_display(self.chat_manager)
   end)
@@ -74,6 +75,7 @@ function AppManager:handle_send_message(message_text)
   end
   
   self.chat_manager:set_last_sent_message(message)
+  self.chat_manager:clear_affected_files()
   self.chat_manager:add_message('user', message)
   self.window_manager:clear_input()
   self.window_manager:update_chat_display(self.chat_manager)
@@ -143,6 +145,51 @@ function AppManager:close()
   self.window_manager:close_chat_window()
   self.chat_manager:cleanup()
   self.is_open = false
+end
+
+function AppManager:open_affected_file_under_cursor()
+  if not self.window_manager or not self.window_manager.chat_bufnr then
+    return false
+  end
+
+  local current_buf = vim.api.nvim_get_current_buf()
+  if current_buf ~= self.window_manager.chat_bufnr then
+    return false
+  end
+
+  local line = vim.api.nvim_get_current_line()
+  local path = line:match('^%-%s+(.+)$')
+  if not path or path == '' then
+    return false
+  end
+
+  if vim.fn.filereadable(path) ~= 1 and vim.fn.isdirectory(path) ~= 1 then
+    return false
+  end
+
+  local chat_winid = self.window_manager.chat_winid
+  local input_winid = self.window_manager.input_winid
+  local target_winid = nil
+  local wins = vim.api.nvim_tabpage_list_wins(0)
+
+  for _, winid in ipairs(wins) do
+    if winid ~= chat_winid and winid ~= input_winid and vim.api.nvim_win_is_valid(winid) then
+      local cfg = vim.api.nvim_win_get_config(winid)
+      if cfg and (cfg.relative == nil or cfg.relative == '') then
+        target_winid = winid
+        break
+      end
+    end
+  end
+
+  if target_winid and vim.api.nvim_win_is_valid(target_winid) then
+    vim.api.nvim_set_current_win(target_winid)
+    vim.cmd('edit ' .. vim.fn.fnameescape(path))
+  else
+    vim.cmd('leftabove vsplit ' .. vim.fn.fnameescape(path))
+  end
+
+  return true
 end
 
 
