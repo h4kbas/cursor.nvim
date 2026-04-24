@@ -32,6 +32,8 @@ function CursorManager.new(opts)
   self.on_permission_request = opts.on_permission_request
   self.on_activity_update = opts.on_activity_update
   self._last_activity_line = nil
+  self._permission_queue = {}
+  self._permission_in_progress = false
 
   return self
 end
@@ -814,10 +816,40 @@ function CursorManager:_handle_request_permission(id, params)
     return
   end
 
-  local request = params or {}
+  table.insert(self._permission_queue, {
+    id = id,
+    request = params or {},
+  })
+  self:_process_permission_queue()
+end
+
+function CursorManager:_process_permission_queue()
+  if self._permission_in_progress then
+    return
+  end
+
+  local item = table.remove(self._permission_queue, 1)
+  if not item then
+    return
+  end
+
+  self._permission_in_progress = true
+  local id = item.id
+  local request = item.request or {}
   local raw_options = request.options or {}
   local options = {}
   self:_notify_permission_request(request)
+
+  local function finish_with_option(option_id)
+    self:_send_response(id, {
+      outcome = {
+        outcome = 'selected',
+        optionId = option_id,
+      },
+    })
+    self._permission_in_progress = false
+    self:_process_permission_queue()
+  end
 
   local function normalize_option(opt, fallback_id)
     if type(opt) == 'string' then
@@ -842,7 +874,7 @@ function CursorManager:_handle_request_permission(id, params)
 
   if type(raw_options) == 'table' then
     local has_array_items = false
-    for i, value in ipairs(raw_options) do
+    for _, value in ipairs(raw_options) do
       has_array_items = true
       local normalized = normalize_option(value)
       if normalized then
@@ -881,14 +913,8 @@ function CursorManager:_handle_request_permission(id, params)
     end)
   end
 
-  -- If no UI is available or no options provided, fall back to allow-once
   if not vim.ui or not vim.ui.select or type(options) ~= 'table' or #options == 0 then
-    self:_send_response(id, {
-      outcome = {
-        outcome = 'selected',
-        optionId = 'allow-once',
-      },
-    })
+    finish_with_option('allow-once')
     return
   end
 
@@ -943,14 +969,7 @@ function CursorManager:_handle_request_permission(id, params)
       if not selected then
         selected = choose_default_option()
       end
-
-      local option_id = selected.id or selected.optionId or 'allow-once'
-      self:_send_response(id, {
-        outcome = {
-          outcome = 'selected',
-          optionId = option_id,
-        },
-      })
+      finish_with_option(selected.id or selected.optionId or 'allow-once')
     end)
   end)
 end
@@ -1401,7 +1420,7 @@ function CursorManager:_ensure_session(current_file, cb)
   end)
 end
 
-function CursorManager:send_chat_message(message, callback)
+function CursorManager:send_chat_message(message, callback, opts)
   if not self.acp.enabled then
     vim.notify('ACP is disabled in CursorManager options.', vim.log.levels.ERROR)
     if callback then
@@ -1411,6 +1430,8 @@ function CursorManager:send_chat_message(message, callback)
   end
 
   local current_file = vim.api.nvim_buf_get_name(0)
+  opts = opts or {}
+  local conversation_context = opts.conversation_context or ''
   local image_prompt_items, cleaned_message = self:_build_image_prompt_items(message)
   local user_request = cleaned_message
   if not user_request or user_request == '' then
@@ -1418,11 +1439,15 @@ function CursorManager:send_chat_message(message, callback)
   end
 
   local full_prompt = self:get_session_context(current_file)
+  local prompt_parts = {}
   if full_prompt ~= '' then
-    full_prompt = full_prompt .. '\n\nUser request: ' .. user_request
-  else
-    full_prompt = user_request
+    table.insert(prompt_parts, full_prompt)
   end
+  if type(conversation_context) == 'string' and conversation_context ~= '' then
+    table.insert(prompt_parts, 'Conversation so far:\n' .. conversation_context)
+  end
+  table.insert(prompt_parts, 'User request: ' .. user_request)
+  full_prompt = table.concat(prompt_parts, '\n\n')
 
   local function finalize_request()
     if not self._active_request then

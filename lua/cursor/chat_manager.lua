@@ -62,6 +62,34 @@ function ChatManager:get_messages()
   return self.messages
 end
 
+function ChatManager:get_conversation_context(max_messages, max_chars)
+  local limit_messages = max_messages or 40
+  local limit_chars = max_chars or 12000
+  local context_lines = {}
+  local messages = self.messages or {}
+  local start_idx = 1
+
+  if #messages > limit_messages then
+    start_idx = #messages - limit_messages + 1
+  end
+
+  for i = start_idx, #messages do
+    local msg = messages[i]
+    if type(msg) == 'table' and type(msg.content) == 'string' and msg.content ~= '' then
+      local role = msg.role == 'user' and 'User' or 'Assistant'
+      table.insert(context_lines, role .. ':')
+      table.insert(context_lines, msg.content)
+      table.insert(context_lines, '')
+    end
+  end
+
+  local context = table.concat(context_lines, '\n')
+  if #context > limit_chars then
+    context = context:sub(#context - limit_chars + 1)
+  end
+  return context
+end
+
 function ChatManager:get_input()
   return table.concat(self.input_buffer, '\n')
 end

@@ -362,6 +362,10 @@ function AppManager:handle_send_message(message_text)
   if not message or message == '' or message:match('^%s*$') then
     return
   end
+  local conversation_context = self.chat_manager:get_conversation_context(
+    self.opts.context_max_messages or 40,
+    self.opts.context_max_chars or 12000
+  )
   
   self.chat_manager:set_last_sent_message(message)
   self.chat_manager:clear_affected_files()
@@ -376,6 +380,7 @@ function AppManager:handle_send_message(message_text)
   table.insert(self.request_queue, {
     id = self.next_request_id,
     message = message,
+    conversation_context = conversation_context,
   })
   self.next_request_id = self.next_request_id + 1
   self:_sync_queue_display(true)
@@ -568,10 +573,17 @@ function AppManager:_process_next_request()
 
   self.current_request = next_item
   self:_sync_queue_display(true)
-  self:send_message(next_item.message)
+  self:send_message(next_item)
 end
 
-function AppManager:send_message(message)
+function AppManager:send_message(message_or_item)
+  local message = message_or_item
+  local conversation_context = ''
+  if type(message_or_item) == 'table' then
+    message = message_or_item.message
+    conversation_context = message_or_item.conversation_context or ''
+  end
+
   self.request_in_flight = true
 
   self.chat_manager:set_status('processing')
@@ -605,7 +617,9 @@ function AppManager:send_message(message)
       self:_sync_queue_display(true)
       self:_process_next_request()
     end
-  end)
+  end, {
+    conversation_context = conversation_context,
+  })
 end
 
 
