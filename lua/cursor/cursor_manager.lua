@@ -30,6 +30,8 @@ function CursorManager.new(opts)
   self._stdout_buffer = {}
   self.terminals = {}
   self.on_permission_request = opts.on_permission_request
+  self.on_activity_update = opts.on_activity_update
+  self._last_activity_line = nil
 
   return self
 end
@@ -526,6 +528,8 @@ function CursorManager:_handle_session_update(update)
     return
   end
 
+  self:_notify_activity_update(update)
+
   local update_type = update.sessionUpdate or update.type
   if update_type ~= 'agent_message_chunk' then
     return
@@ -559,6 +563,208 @@ function CursorManager:_handle_session_update(update)
       cb(current, changes, true)
     end)
   end
+end
+
+function CursorManager:_format_activity_update(update)
+  if type(update) ~= 'table' then
+    return nil
+  end
+
+  local function trim_text(value, max_len)
+    if type(value) ~= 'string' then
+      return nil
+    end
+    local compact = value:gsub('%s+', ' ')
+    if compact == '' then
+      return nil
+    end
+    if #compact > max_len then
+      return compact:sub(1, max_len - 3) .. '...'
+    end
+    return compact
+  end
+
+  local function first_text(tbl)
+    if type(tbl) ~= 'table' then
+      return nil
+    end
+
+    if type(tbl.text) == 'string' and tbl.text ~= '' then
+      return tbl.text
+    end
+    if type(tbl.title) == 'string' and tbl.title ~= '' then
+      return tbl.title
+    end
+    if type(tbl.command) == 'string' and tbl.command ~= '' then
+      return tbl.command
+    end
+    if type(tbl.commandLine) == 'string' and tbl.commandLine ~= '' then
+      return tbl.commandLine
+    end
+
+    local content = tbl.content
+    if type(content) == 'table' then
+      if type(content.text) == 'string' and content.text ~= '' then
+        return content.text
+      end
+      for _, item in ipairs(content) do
+        if type(item) == 'table' then
+          local nested = first_text(item)
+          if nested and nested ~= '' then
+            return nested
+          end
+        elseif type(item) == 'string' and item ~= '' then
+          return item
+        end
+      end
+    end
+
+    return nil
+  end
+
+  local function first_path(tbl)
+    if type(tbl) ~= 'table' then
+      return nil
+    end
+
+    local path = tbl.path or tbl.file or tbl.filePath or tbl.target_file or tbl.targetPath
+    if type(path) == 'string' and path ~= '' then
+      return path
+    end
+
+    local params = tbl.params or tbl.arguments or tbl.args
+    if type(params) == 'table' then
+      return first_path(params)
+    end
+
+    local content = tbl.content
+    if type(content) == 'table' then
+      for _, item in ipairs(content) do
+        if type(item) == 'table' then
+          local nested_path = first_path(item)
+          if nested_path and nested_path ~= '' then
+            return nested_path
+          end
+        end
+      end
+    end
+
+    return nil
+  end
+
+  local function first_cwd(tbl)
+    if type(tbl) ~= 'table' then
+      return nil
+    end
+
+    if type(tbl.cwd) == 'string' and tbl.cwd ~= '' then
+      return tbl.cwd
+    end
+
+    local params = tbl.params or tbl.arguments or tbl.args
+    if type(params) == 'table' then
+      return first_cwd(params)
+    end
+
+    return nil
+  end
+
+  local tool_call = update.toolCall or update.tool_call
+  if type(tool_call) == 'table' then
+    local title = tool_call.title
+    local kind = tool_call.kind
+    local status = tool_call.status
+    local text = nil
+
+    if type(title) == 'string' and title ~= '' then
+      text = title
+    elseif type(kind) == 'string' and kind ~= '' then
+      text = kind
+    end
+
+    if not text then
+      text = first_text(tool_call)
+    end
+
+    local detail_parts = {}
+    local path = first_path(tool_call)
+    if path and path ~= '' then
+      table.insert(detail_parts, 'file=' .. path)
+    end
+
+    local cwd = first_cwd(tool_call)
+    if cwd == path then
+      cwd = nil
+    end
+    if type(cwd) == 'string' and cwd ~= '' then
+      table.insert(detail_parts, 'cwd=' .. cwd)
+    end
+
+    local reason = first_text({ content = tool_call.content, text = tool_call.reason })
+    reason = trim_text(reason, 120)
+    if reason and reason ~= '' and reason ~= text then
+      table.insert(detail_parts, reason)
+    end
+
+    local prefix = 'Activity'
+    if text and text ~= '' then
+      prefix = 'Activity: ' .. trim_text(text, 120)
+    end
+
+    if status and type(status) == 'string' and status ~= '' then
+      prefix = prefix .. ' (' .. status .. ')'
+    end
+
+    if #detail_parts > 0 then
+      return prefix .. ' | ' .. table.concat(detail_parts, ' | ')
+    end
+
+    return prefix
+  end
+
+  local candidate = nil
+  local path = update.path or update.file or update.filePath
+  local status = update.status
+  local update_type = update.sessionUpdate or update.type
+
+  if type(path) == 'string' and path ~= '' then
+    if update_type == 'file_edit' or update_type == 'file_update' or update_type == 'fs_write' then
+      candidate = 'Editing file: ' .. path
+    elseif update_type == 'fs_read' then
+      candidate = 'Reading file: ' .. path
+    else
+      candidate = 'File activity: ' .. path
+    end
+  elseif type(update_type) == 'string' and update_type ~= '' and update_type ~= 'agent_message_chunk' then
+    candidate = 'Activity: ' .. update_type
+  end
+
+  if candidate and type(status) == 'string' and status ~= '' then
+    candidate = candidate .. ' (' .. status .. ')'
+  end
+
+  return candidate
+end
+
+function CursorManager:_notify_activity_update(update)
+  local cb = self.on_activity_update
+  if type(cb) ~= 'function' then
+    return
+  end
+
+  local line = self:_format_activity_update(update)
+  if not line or line == '' then
+    return
+  end
+
+  if line == self._last_activity_line then
+    return
+  end
+  self._last_activity_line = line
+
+  vim.schedule(function()
+    cb(line, update)
+  end)
 end
 
 function CursorManager:_handle_request_permission(id, params)
@@ -902,6 +1108,14 @@ function CursorManager:set_permission_request_handler(handler)
     self.on_permission_request = handler
   else
     self.on_permission_request = nil
+  end
+end
+
+function CursorManager:set_activity_update_handler(handler)
+  if type(handler) == 'function' then
+    self.on_activity_update = handler
+  else
+    self.on_activity_update = nil
   end
 end
 

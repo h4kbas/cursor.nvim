@@ -45,6 +45,10 @@ function AppManager:open_chat()
     self.chat_manager:add_message('assistant', content)
     self.window_manager:update_chat_display(self.chat_manager)
   end)
+  self.cursor_manager:set_activity_update_handler(function(content)
+    self.chat_manager:upsert_activity_message(content)
+    self.window_manager:update_chat_display(self.chat_manager)
+  end)
   
   self.window_manager.opts = self.opts
   

@@ -35,6 +35,21 @@ function ChatManager:add_message(role, content)
   })
 end
 
+function ChatManager:upsert_activity_message(content)
+  if not content or content == '' then
+    return
+  end
+
+  local last = self.messages[#self.messages]
+  if last and last.role == 'assistant' and type(last.content) == 'string' and last.content:match('^Activity:') then
+    last.content = content
+    last.timestamp = os.time()
+    return
+  end
+
+  self:add_message('assistant', content)
+end
+
 function ChatManager:get_messages()
   return self.messages
 end
